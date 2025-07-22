@@ -10,13 +10,21 @@ import {
   Image
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useNavigation } from '@react-navigation/native';
+import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 
 const { width, height } = Dimensions.get('window');
+type RootStackParamList = {
+  Onboarding: undefined;
+  Map: undefined;
+};
+type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
 export default function OnboardingScreen() {
   const [currentSlide, setCurrentSlide] = useState(0);
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [language, setLanguage] = useState('fr'); // fr or en
+  const navigation = useNavigation<NavigationProp>();
 
   const slides = [
     {
@@ -64,7 +72,7 @@ export default function OnboardingScreen() {
 
   const handleStart = () => {
     // Handle start button press - request location permissions, navigate to main app
-    console.log('Starting app...');
+     navigation.navigate('Map');
   };
 
   const bgColor = isDarkMode ? 'bg-gray-900' : 'bg-white';
