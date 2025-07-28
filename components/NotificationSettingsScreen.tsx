@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -12,6 +12,9 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { useSettings } from '../SettingsContext';
+import * as Notifications from 'expo-notifications';
+import Constants from 'expo-constants';
 
 type RootStackParamList = {
   Onboarding: undefined;
@@ -21,25 +24,66 @@ type RootStackParamList = {
 };
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
+const BASE_URL = 'http://192.168.1.6:8080';
+
 export default function NotificationSettingsScreen() {
+  const { settings, updateSettings } = useSettings();
   const [isDarkMode, setIsDarkMode] = useState(false);
-  const [language, setLanguage] = useState('fr'); // fr or en
+  const [language, setLanguage] = useState('fr');
   const navigation = useNavigation<NavigationProp>();
 
-  // Notification settings state
-  const [settings, setSettings] = useState({
-    notifications: true,
-    locationAlerts: true,
-    dailyTips: false,
-    sounds: true,
-    vibrations: true
-  });
+  useEffect(() => {
+    if (Constants.appOwnership === 'expo') {
+      console.warn('Notifications disabled in Expo Go. Use a development build: https://docs.expo.dev/develop/development-builds/introduction/');
+      return;
+    }
+    if (!settings.dailyTips) {
+      Notifications.cancelAllScheduledNotificationsAsync().catch(err => console.error('Failed to cancel notifications:', err));
+      return;
+    }
+
+    const scheduleDailyTip = async () => {
+      try {
+        const { status } = await Notifications.requestPermissionsAsync();
+        if (status !== 'granted') {
+          console.warn('Notification permissions denied');
+          return;
+        }
+        let message = language === 'fr' ? 'Restez hydraté et portez de la crème solaire !' : 'Stay hydrated and wear sunscreen!';
+        try {
+          const response = await fetch(`${BASE_URL}/api/tips/daily?language=${language}`);
+          if (!response.ok) {
+            console.error(`Failed to fetch daily tip: ${response.status}`);
+            throw new Error('Failed to fetch daily tip');
+          }
+          const { message: fetchedMessage } = await response.json();
+          message = fetchedMessage || message;
+        } catch (fetchError) {
+          console.warn('Using fallback daily tip due to fetch error:', fetchError);
+        }
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: language === 'fr' ? 'Conseil du Jour' : 'Daily Tip',
+            body: message,
+            sound: settings.sounds ? 'default' : undefined,
+            vibrate: settings.vibrations ? [0, 250, 250, 250] : undefined,
+          },
+          trigger: { hour: 8, minute: 0, repeats: true },
+        });
+        console.log('Daily tip scheduled:', message);
+      } catch (error) {
+        console.error('Failed to schedule daily tip:', error);
+      }
+    };
+
+    scheduleDailyTip();
+    return () => {
+      Notifications.cancelAllScheduledNotificationsAsync().catch(err => console.error('Failed to cancel notifications:', err));
+    };
+  }, [settings.dailyTips, settings.sounds, settings.vibrations, language]);
 
   const toggleSetting = (key: keyof typeof settings) => {
-    setSettings(prev => ({
-      ...prev,
-      [key]: !prev[key]
-    }));
+    updateSettings({ [key]: !settings[key] });
   };
 
   const toggleTheme = () => {
@@ -83,7 +127,7 @@ export default function NotificationSettingsScreen() {
           text: language === 'fr' ? 'Réinitialiser' : 'Reset',
           style: 'destructive',
           onPress: () => {
-            setSettings({
+            updateSettings({
               notifications: true,
               locationAlerts: true,
               dailyTips: false,
@@ -96,7 +140,6 @@ export default function NotificationSettingsScreen() {
     );
   };
 
-  // Toggle settings data
   const toggleSettings = [
     {
       id: 'notifications',
@@ -155,7 +198,6 @@ export default function NotificationSettingsScreen() {
     }
   ];
 
-  // Action buttons data
   const actionButtons = [
     {
       id: 'help',
@@ -194,8 +236,6 @@ export default function NotificationSettingsScreen() {
         barStyle={isDarkMode ? 'light-content' : 'dark-content'}
         backgroundColor={isDarkMode ? '#111827' : '#ffffff'}
       />
-      
-      {/* Header */}
       <View className="flex-row justify-between items-center px-6 py-4">
         <TouchableOpacity
           onPress={() => navigation.goBack()}
@@ -208,11 +248,9 @@ export default function NotificationSettingsScreen() {
             color={isDarkMode ? '#d1d5db' : '#6b7280'}
           />
         </TouchableOpacity>
-
         <Text className={`text-lg font-bold ${textColor}`}>
           {language === 'fr' ? 'Notifications' : 'Notifications'}
         </Text>
-        
         <View className="flex-row">
           <TouchableOpacity
             onPress={toggleTheme}
@@ -225,7 +263,6 @@ export default function NotificationSettingsScreen() {
               color={isDarkMode ? '#fbbf24' : '#6b7280'}
             />
           </TouchableOpacity>
-          
           <TouchableOpacity
             onPress={toggleLanguage}
             className="px-3 py-1 rounded-full"
@@ -237,9 +274,7 @@ export default function NotificationSettingsScreen() {
           </TouchableOpacity>
         </View>
       </View>
-
       <ScrollView className="flex-1" showsVerticalScrollIndicator={false}>
-        {/* Notification Toggles Section */}
         <View className="px-6 mb-6">
           <View className={`${cardBgColor} rounded-3xl p-6`}>
             <View className="flex-row items-center mb-4">
@@ -253,7 +288,6 @@ export default function NotificationSettingsScreen() {
                 {language === 'fr' ? 'Préférences' : 'Preferences'}
               </Text>
             </View>
-            
             {toggleSettings.map((setting, index) => (
               <View key={setting.id}>
                 <View className="flex-row items-center justify-between py-4">
@@ -279,7 +313,6 @@ export default function NotificationSettingsScreen() {
                     ios_backgroundColor={isDarkMode ? '#374151' : '#e5e7eb'}
                   />
                 </View>
-                
                 {index < toggleSettings.length - 1 && (
                   <View 
                     className="h-px"
@@ -290,8 +323,6 @@ export default function NotificationSettingsScreen() {
             ))}
           </View>
         </View>
-
-        {/* Quick Settings Summary */}
         <View className="px-6 mb-6">
           <View className={`${cardBgColor} rounded-3xl p-6`}>
             <View className="flex-row items-center mb-4">
@@ -305,12 +336,10 @@ export default function NotificationSettingsScreen() {
                 {language === 'fr' ? 'État actuel' : 'Current Status'}
               </Text>
             </View>
-            
             <View className="flex-row flex-wrap">
               {Object.entries(settings).map(([key, value]) => {
                 const setting = toggleSettings.find(s => s.key === key);
                 if (!setting) return null;
-                
                 return (
                   <View key={key} className="w-1/2 p-1">
                     <View 
@@ -334,8 +363,6 @@ export default function NotificationSettingsScreen() {
             </View>
           </View>
         </View>
-
-        {/* Action Buttons Section */}
         <View className="px-6 mb-8">
           <View className={`${cardBgColor} rounded-3xl p-6`}>
             <View className="flex-row items-center mb-4">
@@ -349,7 +376,6 @@ export default function NotificationSettingsScreen() {
                 {language === 'fr' ? 'Actions' : 'Actions'}
               </Text>
             </View>
-            
             {actionButtons.map((button, index) => (
               <View key={button.id}>
                 <TouchableOpacity
@@ -366,7 +392,6 @@ export default function NotificationSettingsScreen() {
                     color={button.color}
                   />
                 </TouchableOpacity>
-                
                 {index < actionButtons.length - 1 && (
                   <View 
                     className="h-px ml-12"
@@ -377,8 +402,6 @@ export default function NotificationSettingsScreen() {
             ))}
           </View>
         </View>
-
-        {/* Footer Info */}
         <View className="px-6 mb-8">
           <View 
             className="rounded-3xl p-4 items-center"

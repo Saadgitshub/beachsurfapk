@@ -63,6 +63,13 @@ interface SafetyInfo {
   category: string;
 }
 
+interface Alert {
+  id: number;
+  type: string;
+  message: string;
+  beachId: number;
+}
+
 const { width } = Dimensions.get('window');
 const BASE_URL = 'http://192.168.1.6:8080';
 
@@ -186,6 +193,7 @@ export default function BeachSafetyScreen() {
   const [lifeguardStations, setLifeguardStations] = useState<LifeguardStation[]>([]);
   const [facilities, setFacilities] = useState<Facility[]>([]);
   const [emergencyContacts, setEmergencyContacts] = useState<EmergencyContact[]>([]);
+  const [alerts, setAlerts] = useState<Alert[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const navigation = useNavigation<NavigationProp>();
@@ -305,8 +313,52 @@ export default function BeachSafetyScreen() {
     }
   };
 
+  const fetchAlerts = async (retryCount = 3, delay = 2000, timeout = 10000) => {
+    const url = `${BASE_URL}/api/alerts/beach/1`;
+    console.log(`Fetching alerts from: ${url}`);
+    let attempt = 1;
+    while (attempt <= retryCount || retryCount === 0) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error(`Fetch attempt ${attempt} failed. Status: ${response.status}, Body: ${errorText.substring(0, 200)}`);
+          throw new Error(`HTTP error! Status: ${response.status}`);
+        }
+        const data: Alert[] = await response.json();
+        console.log('Raw alert data:', JSON.stringify(data, null, 2));
+        setAlerts(data);
+        return;
+      } catch (err: any) {
+        console.error(`Fetch attempt ${attempt} error: ${err.message}, Name: ${err.name}, Code: ${err.code || 'N/A'}`);
+        if (retryCount !== 0 && attempt === retryCount) {
+          console.warn('All alert fetch attempts failed');
+          setError(
+            language === 'fr'
+              ? `Échec de récupération des alertes après ${retryCount} tentatives.`
+              : `Failed to fetch alerts after ${retryCount} attempts.`
+          );
+          return;
+        }
+        attempt++;
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  };
+
   useEffect(() => {
     fetchSafetyInfo();
+    fetchAlerts();
   }, [language]);
 
   const toggleTheme = () => {
@@ -319,6 +371,32 @@ export default function BeachSafetyScreen() {
 
   const toggleSection = (sectionId: string) => {
     setExpandedSection(expandedSection === sectionId ? null : sectionId);
+  };
+
+  const getAlertIcon = (type: string): string => {
+    switch (type.toUpperCase()) {
+      case 'BATHING':
+        return 'checkmark-circle';
+      case 'SPORTS':
+        return 'fitness';
+      case 'DANGER':
+        return 'warning';
+      default:
+        return 'warning';
+    }
+  };
+
+  const getAlertColor = (type: string): string => {
+    switch (type.toUpperCase()) {
+      case 'BATHING':
+        return '#3b82f6'; // Blue for safe
+      case 'SPORTS':
+        return '#ef4444'; // Red for sports
+      case 'DANGER':
+        return '#ff0000'; // Bright red for danger
+      default:
+        return '#ff0000';
+    }
   };
 
   const bgColor = isDarkMode ? 'bg-gray-900' : 'bg-white';
@@ -387,7 +465,7 @@ export default function BeachSafetyScreen() {
           <Ionicons name="warning" size={40} color="#ef4444" />
           <Text className={`text-lg ${textColor} mt-4 text-center`}>{error}</Text>
           <TouchableOpacity
-            onPress={() => fetchSafetyInfo()}
+            onPress={() => { fetchSafetyInfo(); fetchAlerts(); }}
             className="mt-4 bg-blue-500 px-4 py-2 rounded-lg"
           >
             <Text className="text-white font-bold">
@@ -452,6 +530,60 @@ export default function BeachSafetyScreen() {
               </View>
             </TouchableOpacity>
           </View>
+
+          {alerts.length > 0 && (
+            <View className="px-6 mb-6">
+              <View className={`${cardBgColor} rounded-3xl p-6`}>
+                <View className="flex-row items-center mb-4">
+                  <View
+                    className="w-10 h-10 rounded-full items-center justify-center mr-3"
+                    style={{ backgroundColor: '#ff0000' + '20' }}
+                  >
+                    <Ionicons name="warning" size={20} color="#ff0000" />
+                  </View>
+                  <Text className={`text-lg font-bold ${textColor}`}>
+                    ⚠️ {language === 'fr' ? 'Alertes Actives' : 'Active Alerts'}
+                  </Text>
+                </View>
+                
+                {alerts.map((alert, index) => (
+                  <View key={alert.id}>
+                    <TouchableOpacity
+                      onPress={() => toggleSection(`alert-${alert.id}`)}
+                      className="flex-row items-center justify-between py-3"
+                    >
+                      <View className="flex-row items-center flex-1">
+                        <Ionicons name={getAlertIcon(alert.type)} size={20} color={getAlertColor(alert.type)} />
+                        <Text className={`ml-3 font-medium ${textColor} flex-1`}>
+                          {alert.type}
+                        </Text>
+                      </View>
+                      <Ionicons
+                        name={expandedSection === `alert-${alert.id}` ? 'chevron-up' : 'chevron-down'}
+                        size={20}
+                        color={secondaryTextColor}
+                      />
+                    </TouchableOpacity>
+                    
+                    {expandedSection === `alert-${alert.id}` && (
+                      <View className="pl-8 pb-3">
+                        <Text className={`${secondaryTextColor} leading-5`}>
+                          {alert.message}
+                        </Text>
+                      </View>
+                    )}
+                    
+                    {index < alerts.length - 1 && (
+                      <View 
+                        className="h-px ml-8"
+                        style={{ backgroundColor: isDarkMode ? '#374151' : '#e5e7eb' }}
+                      />
+                    )}
+                  </View>
+                ))}
+              </View>
+            </View>
+          )}
 
           {safetyRules.length > 0 && (
             <View className="px-6 mb-6">

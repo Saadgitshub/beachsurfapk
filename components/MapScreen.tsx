@@ -7,22 +7,23 @@ import {
   StatusBar,
   Dimensions,
   Animated,
-  Modal,
   Platform,
   Linking,
   StyleSheet,
+  Modal,
 } from 'react-native';
 import MapView, { Marker, Polygon, PROVIDER_GOOGLE } from 'react-native-maps';
 import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
+import Constants from 'expo-constants';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useSettings } from '../SettingsContext';
 
-type ZoneType = 'safe' | 'sport' | 'danger';
+type ZoneType = 'safe' | 'sport' | 'danger' | 'unknown';
 type LanguageType = 'fr' | 'en';
-type IoniconName = 'checkmark-circle' | 'fitness' | 'warning' | 'notifications-outline' | 'shield-checkmark' | 'moon' | 'sunny' | 'locate' | 'menu' | 'close' | 'shield-checkmark-outline' | 'call-outline' | 'book-outline' | 'notifications';
+type IoniconName = 'checkmark-circle' | 'fitness' | 'warning' | 'notifications-outline' | 'shield-checkmark' | 'moon' | 'sunny' | 'locate' | 'menu' | 'close' | 'shield-checkmark-outline' | 'call-outline' | 'book-outline' | 'notifications' | 'information-circle';
 
 type RootStackParamList = {
   Onboarding: undefined;
@@ -64,10 +65,19 @@ interface Alert {
   type: string;
   message: string;
   beachId: number;
+  zoneId?: number;
+}
+
+interface User {
+  id?: number;
+  deviceId: string;
+  latitude: number;
+  longitude: number;
 }
 
 const { width } = Dimensions.get('window');
 const BASE_URL = 'http://192.168.1.6:8080';
+const USE_MOCK_LOCATION = false; // Set to false to use device GPS
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -82,15 +92,17 @@ export default function MapScreen() {
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [language, setLanguage] = useState<LanguageType>('fr');
   const [userLocation, setUserLocation] = useState<UserLocation | null>(null);
-  const [currentZone, setCurrentZone] = useState<ZoneType>('safe');
+  const [currentZone, setCurrentZone] = useState<ZoneType>('unknown');
+  const [currentZoneId, setCurrentZoneId] = useState<number | null>(null);
+  const [currentBeach, setCurrentBeach] = useState<Beach | null>(null);
+  const [currentAlertMessage, setCurrentAlertMessage] = useState<string | null>(null);
   const [showLegend, setShowLegend] = useState<boolean>(false);
   const [showQuickActions, setShowQuickActions] = useState<boolean>(false);
   const [beaches, setBeaches] = useState<Beach[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [showAlertModal, setShowAlertModal] = useState<boolean>(false);
-  const [currentAlert, setCurrentAlert] = useState<Alert | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [deviceId, setDeviceId] = useState<string>(Constants.installationId || 'test-device');
   const mapRef = useRef<MapView>(null);
   const legendAnimation = useRef(new Animated.Value(0)).current;
   const quickActionsAnimation = useRef(new Animated.Value(0)).current;
@@ -98,345 +110,456 @@ export default function MapScreen() {
   const previousZoneRef = useRef<ZoneType | null>(null);
 
   const initialRegion = {
-    latitude: 31.500289,
-    longitude: -9.76368,
+    latitude: 32.299507, // Safi
+    longitude: -9.237183,
     latitudeDelta: 0.01,
     longitudeDelta: 0.01,
   };
 
   useEffect(() => {
+    console.log('Settings:', settings);
+    console.log('Device ID:', deviceId);
+    if (Constants.appOwnership === 'expo') {
+      console.warn('Notifications disabled in Expo Go');
+    }
     const setupNotifications = async () => {
       if (!settings.notifications) return;
-      const { status } = await Notifications.requestPermissionsAsync();
-      if (status !== 'granted') {
-        console.warn('Notification permissions denied');
-      }
-      if (Platform.OS === 'android' && settings.sounds) {
-        await Notifications.setNotificationChannelAsync('default', {
-          name: 'default',
-          importance: Notifications.AndroidImportance.HIGH,
-          vibrationPattern: settings.vibrations ? [0, 250, 250, 250] : undefined,
-          lightColor: '#FF231F7C',
-        });
+      try {
+        const { status } = await Notifications.requestPermissionsAsync();
+        if (status !== 'granted') {
+          console.warn('Notification permissions denied');
+          return;
+        }
+        if (Platform.OS === 'android' && settings.sounds) {
+          await Notifications.setNotificationChannelAsync('default', {
+            name: 'default',
+            importance: Notifications.AndroidImportance.HIGH,
+            vibrationPattern: settings.vibrations ? [0, 250, 250, 250] : undefined,
+            lightColor: '#FF231F7C',
+          });
+        }
+      } catch (error) {
+        console.error('Error setting up notifications:', error);
       }
     };
     setupNotifications();
+    fetchBeaches();
+    getUserLocation();
   }, [settings.notifications, settings.sounds, settings.vibrations]);
 
   const mapZoneType = (backendType: string): ZoneType => {
-    switch (backendType.toUpperCase()) {
-      case 'BATHING':
-        return 'safe';
-      case 'SPORTS':
-        return 'sport';
-      default:
-        return 'danger';
+    const type = backendType.toUpperCase();
+    console.log('Mapping zone type:', type);
+    switch (type) {
+      case 'BATHING': return 'safe';
+      case 'SPORTS': return 'sport';
+      default: return 'danger';
     }
   };
 
   const mapAlertTypeToZoneType = (alertType: string): ZoneType => {
-    switch (alertType.toUpperCase()) {
-      case 'BATHING':
-        return 'safe';
-      case 'SPORTS':
-        return 'sport';
-      case 'DANGER':
-        return 'danger';
-      default:
-        return 'danger';
+    const type = alertType.toUpperCase();
+    console.log('Mapping alert type:', type);
+    switch (type) {
+      case 'BATHING': return 'safe';
+      case 'SPORTS': return 'sport';
+      case 'DANGER': return 'danger';
+      default: return 'danger';
     }
   };
 
   const parseGeoJSONCoordinates = (geoJsonString: string): LocationCoords[] => {
     try {
       const geoJson = JSON.parse(geoJsonString);
+      console.log('Parsing GeoJSON:', geoJson);
       if (geoJson.type !== 'Polygon' || !Array.isArray(geoJson.coordinates) || geoJson.coordinates.length === 0) {
-        console.warn('Invalid GeoJSON format');
+        console.warn('Invalid GeoJSON format:', geoJson);
         return [];
       }
       const coords = geoJson.coordinates[0];
       if (!Array.isArray(coords) || coords.length < 3) {
-        console.warn('Invalid coordinates: must be an array with at least 3 points');
+        console.warn('Invalid coordinates:', coords);
         return [];
       }
-      return coords.map(([longitude, latitude]: [number, number]) => ({
-        latitude,
-        longitude,
-      }));
+      const parsedCoords = coords.map(([longitude, latitude]: [number, number], index: number) => {
+        if (isNaN(latitude) || isNaN(longitude)) {
+          console.error(`Invalid coordinate at index ${index}: [${longitude}, ${latitude}]`);
+          return null;
+        }
+        return { latitude, longitude };
+      }).filter((coord): coord is LocationCoords => coord !== null);
+      console.log('Parsed coordinates:', parsedCoords);
+      return parsedCoords;
     } catch (e) {
-      console.warn('Error parsing GeoJSON:', e);
+      console.warn('Error parsing GeoJSON:', e, 'for string:', geoJsonString);
       return [];
     }
   };
 
-  const validateCoordinates = (coords: LocationCoords[]): boolean => {
-    if (!Array.isArray(coords) || coords.length < 3) {
-      console.warn('Invalid coordinates: must be an array with at least 3 points');
-      return false;
-    }
-    return coords.every(coord => {
-      if (!coord || typeof coord.latitude !== 'number' || typeof coord.longitude !== 'number') {
-        console.warn(`Invalid coordinate: ${JSON.stringify(coord)}`);
-        return false;
-      }
-      return true;
-    });
-  };
-
-  const fetchBeaches = async (retryCount = 3, delay = 2000, timeout = 10000) => {
-    const url = `${BASE_URL}/api/beaches`;
-    console.log(`Fetching beaches from: ${url}`);
-    let attempt = 1;
-    while (attempt <= retryCount || retryCount === 0) {
-      try {
-        setLoading(true);
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeout);
-        const response = await fetch(url, {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-          },
-          signal: controller.signal,
-        });
-        clearTimeout(timeoutId);
-        if (!response.ok) {
-          const errorText = await response.text();
-          console.error(`Fetch attempt ${attempt} failed. Status: ${response.status}, Body: ${errorText.substring(0, 200)}`);
-          throw new Error(`HTTP error! Status: ${response.status}`);
-        }
-        const data: Beach[] = await response.json();
-        console.log('Raw beach data:', JSON.stringify(data, null, 2));
-        const mappedData = data
-          .filter(beach => beach.name === 'Essaouira Beach')
-          .map(beach => ({
-            ...beach,
-            zones: beach.zones.map(zone => {
-              const coordinates = typeof zone.coordinates === 'string'
-                ? parseGeoJSONCoordinates(zone.coordinates)
-                : Array.isArray(zone.coordinates)
-                  ? zone.coordinates.map(coord => ({
-                      latitude: Number(coord.latitude),
-                      longitude: Number(coord.longitude),
-                    }))
-                  : [];
-              if (!validateCoordinates(coordinates)) {
-                console.warn(`Invalid coordinates for zone ${zone.id}, using empty array`);
-                return { ...zone, type: mapZoneType(zone.type), coordinates: [] };
-              }
-              return { ...zone, type: mapZoneType(zone.type), coordinates };
-            }),
-          }));
-        console.log('Mapped beach data:', JSON.stringify(mappedData, null, 2));
-        setBeaches(mappedData);
-        setError(null);
-        setLoading(false);
-        return;
-      } catch (err: any) {
-        console.error(`Fetch attempt ${attempt} error: ${err.message}, Name: ${err.name}, Code: ${err.code || 'N/A'}`);
-        if (retryCount !== 0 && attempt === retryCount) {
-          console.warn('All fetch attempts failed');
-          setError(
-            language === 'fr'
-              ? `Échec de connexion à ${url} après ${retryCount} tentatives (${err.message}).`
-              : `Failed to connect to ${url} after ${retryCount} attempts (${err.message}).`
-          );
-          setLoading(false);
-          return;
-        }
-        attempt++;
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
+  const fetchBeaches = async () => {
+    try {
+      setLoading(true);
+      const response = await fetch(`${BASE_URL}/api/beaches?language=${language}`, {
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      });
+      if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+      const data: Beach[] = await response.json();
+      console.log('Fetched beaches:', JSON.stringify(data, null, 2));
+      const mappedData = data.map(beach => ({
+        ...beach,
+        zones: beach.zones.map(zone => ({
+          ...zone,
+          coordinates: typeof zone.coordinates === 'string'
+            ? parseGeoJSONCoordinates(zone.coordinates)
+            : Array.isArray(zone.coordinates)
+              ? zone.coordinates.map(coord => ({
+                  latitude: Number(coord.latitude),
+                  longitude: Number(coord.longitude),
+                }))
+              : [],
+          type: mapZoneType(zone.type),
+        })),
+      }));
+      setBeaches(mappedData);
+      setError(null);
+    } catch (err: any) {
+      console.error('Fetch beaches error:', err);
+      setError(language === 'fr' ? 'Échec de chargement des plages.' : 'Failed to load beaches.');
+    } finally {
+      setLoading(false);
     }
   };
 
-  const fetchAlerts = async (beachId: number, retryCount = 3, delay = 2000, timeout = 10000) => {
-    const url = `${BASE_URL}/api/alerts/beach/${beachId}`;
-    console.log(`Fetching alerts from: ${url}`);
-    let attempt = 1;
-    while (attempt <= retryCount || retryCount === 0) {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeout);
-        const response = await fetch(url, {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-          },
-          signal: controller.signal,
-        });
-        clearTimeout(timeoutId);
-        if (!response.ok) {
-          const errorText = await response.text();
-          console.error(`Fetch attempt ${attempt} failed. Status: ${response.status}, Body: ${errorText.substring(0, 200)}`);
-          throw new Error(`HTTP error! Status: ${response.status}`);
-        }
-        const data: Alert[] = await response.json();
-        console.log('Raw alert data:', JSON.stringify(data, null, 2));
-        setAlerts(data);
-        setLoading(false);
-        return;
-      } catch (err: any) {
-        console.error(`Fetch attempt ${attempt} error: ${err.message}, Name: ${err.name}, Code: ${err.code || 'N/A'}`);
-        if (retryCount !== 0 && attempt === retryCount) {
-          console.warn('All alert fetch attempts failed');
-          setError(
-            language === 'fr'
-              ? `Échec de récupération des alertes après ${retryCount} tentatives.`
-              : `Failed to fetch alerts after ${retryCount} attempts.`
-          );
-          setLoading(false);
-          return;
-        }
-        attempt++;
-        await new Promise(resolve => setTimeout(resolve, delay));
+  const fetchAlerts = async (beachId: number, retryCount = 0): Promise<Alert[]> => {
+    const maxRetries = 3;
+    try {
+      console.log(`Fetching alerts for beachId ${beachId} (Attempt ${retryCount + 1}/${maxRetries})`);
+      const response = await fetch(`${BASE_URL}/api/alerts/beach/${beachId}`, {
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      });
+      if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+      const data: Alert[] = await response.json();
+      console.log('Fetched alerts:', JSON.stringify(data, null, 2));
+      if (data.length === 0) {
+        console.warn(`No alerts found for beachId ${beachId}`);
       }
+      setAlerts(data);
+      return data;
+    } catch (err: any) {
+      console.error('Fetch alerts error:', err);
+      if (retryCount < maxRetries - 1) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        return fetchAlerts(beachId, retryCount + 1);
+      }
+      setError(language === 'fr' ? 'Échec de récupération des alertes.' : 'Failed to fetch alerts.');
+      return [];
     }
   };
 
-  useEffect(() => {
-    fetchBeaches();
-    fetchAlerts(1); // Essaouira Beach ID
-    getUserLocation();
-  }, []);
-
-  useEffect(() => {
-    if (showLegend) {
-      Animated.spring(legendAnimation, {
-        toValue: 1,
-        useNativeDriver: true,
-        tension: 100,
-        friction: 8,
-      }).start();
-    } else {
-      Animated.spring(legendAnimation, {
-        toValue: 0,
-        useNativeDriver: true,
-        tension: 100,
-        friction: 8,
-      }).start();
+  const updateUserLocation = async (coords: LocationCoords) => {
+    try {
+      console.log(`Updating user location for deviceId ${deviceId}:`, coords);
+      const response = await fetch(`${BASE_URL}/api/users/update-location`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+          deviceId,
+          latitude: coords.latitude,
+          longitude: coords.longitude,
+        }),
+      });
+      if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+      const updatedUser: User = await response.json();
+      console.log('Updated user location:', updatedUser);
+      setUserLocation({ latitude: updatedUser.latitude, longitude: updatedUser.longitude });
+      return updatedUser;
+    } catch (err: any) {
+      console.error('Update user location error:', err);
+      setError(language === 'fr' ? 'Échec de mise à jour de la localisation.' : 'Failed to update location.');
+      await fetchUserLocation();
     }
-  }, [showLegend]);
+  };
 
-  useEffect(() => {
-    if (showQuickActions) {
-      Animated.spring(quickActionsAnimation, {
-        toValue: 1,
-        useNativeDriver: true,
-        tension: 100,
-        friction: 8,
-      }).start();
-    } else {
-      Animated.spring(quickActionsAnimation, {
-        toValue: 0,
-        useNativeDriver: true,
-        tension: 100,
-        friction: 8,
-      }).start();
+  const fetchUserLocation = async () => {
+    try {
+      console.log(`Fetching user location for deviceId ${deviceId}`);
+      const response = await fetch(`${BASE_URL}/api/users/location/${deviceId}`, {
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      });
+      if (!response.ok) {
+        if (response.status === 404) {
+          console.log('No user location found for deviceId:', deviceId);
+          return null;
+        }
+        throw new Error(`HTTP error: ${response.status}`);
+      }
+      const user: User = await response.json();
+      console.log('Fetched user location:', user);
+      if (user.latitude && user.longitude) {
+        const coords = { latitude: user.latitude, longitude: user.longitude };
+        setUserLocation(coords);
+        await determineCurrentZone(coords);
+        return coords;
+      }
+      return null;
+    } catch (err: any) {
+      console.error('Fetch user location error:', err);
+      setError(language === 'fr' ? 'Échec de récupération de la localisation.' : 'Failed to fetch location.');
+      return null;
     }
-  }, [showQuickActions]);
+  };
 
   const getUserLocation = async () => {
     try {
-      let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        console.log('Permission to access location was denied');
-        setError(
-          language === 'fr'
-            ? 'Permission d\'accès à la localisation refusée.'
-            : 'Permission to access location denied.'
-        );
+      console.log('Requesting device location...');
+      if (USE_MOCK_LOCATION) {
+        console.log('Using mock location for Safi Bathing Zone');
+        const mockLocation = { latitude: 32.299507, longitude: -9.237183 };
+        setUserLocation(mockLocation);
+        await updateUserLocation(mockLocation);
+        await determineCurrentZone(mockLocation);
         return;
       }
-
-      let location = await Location.getCurrentPositionAsync({});
+      let { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        console.warn('Permission to access location denied');
+        setError(language === 'fr' ? 'Permission d\'accès à la localisation refusée.' : 'Permission to access location denied.');
+        await fetchUserLocation();
+        return;
+      }
+      let location = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
       const newLocation = {
         latitude: location.coords.latitude,
         longitude: location.coords.longitude,
       };
+      console.log('Device location:', newLocation);
       setUserLocation(newLocation);
+      await updateUserLocation(newLocation);
       await determineCurrentZone(newLocation);
     } catch (error) {
-      console.log('Error getting location:', error);
-      setError(
-        language === 'fr'
-          ? 'Échec de l\'obtention de la localisation.'
-          : 'Failed to get user location.'
-      );
+      console.error('Device location error:', error);
+      setError(language === 'fr' ? 'Échec de l\'obtention de la localisation.' : 'Failed to get device location.');
+      await fetchUserLocation();
     }
   };
 
-  const determineCurrentZone = async (coords: LocationCoords): Promise<void> => {
-    if (!settings.notifications || !settings.locationAlerts) {
-      setCurrentZone('safe');
+const centerMapOnUser = async (): Promise<void> => {
+  try {
+    console.log('Centering map on user location...');
+    if (USE_MOCK_LOCATION) {
+      console.log('Using mock location for Safi Bathing Zone');
+      const mockLocation = { latitude: 32.299507, longitude: -9.237183 };
+      setUserLocation(mockLocation);
+      await updateUserLocation(mockLocation);
+      await determineCurrentZone(mockLocation);
+      if (mapRef.current) {
+        mapRef.current.animateToRegion(
+          {
+            ...mockLocation,
+            latitudeDelta: 0.01,
+            longitudeDelta: 0.01,
+          },
+          1000
+        );
+      }
       return;
     }
 
-    let foundZone: ZoneType = 'danger';
-    for (const beach of beaches) {
-      for (const zone of beach.zones) {
-        if (zone.coordinates.length >= 3 && isPointInPolygon(coords, zone.coordinates)) {
-          foundZone = zone.type;
-          break;
-        }
-      }
-      if (foundZone !== 'danger') break;
-    }
-
-    if (foundZone !== previousZoneRef.current) {
-      console.log(`Zone changed from ${previousZoneRef.current} to ${foundZone}`);
-      const alert = alerts.find(a => mapAlertTypeToZoneType(a.type) === foundZone);
-      if (alert && settings.notifications && settings.locationAlerts) {
-        console.log(`Triggering alert for ${foundZone}: ${alert.message}`);
-        await Notifications.scheduleNotificationAsync({
-          content: {
-            title: language === 'fr' ? 'Alerte Plage' : 'Beach Alert',
-            body: alert.message,
-            data: { zone: foundZone },
-            sound: settings.sounds ? 'default' : undefined,
-            vibrate: settings.vibrations ? [0, 250, 250, 250] : undefined,
-            priority: foundZone === 'danger' ? Notifications.AndroidNotificationPriority.HIGH : Notifications.AndroidNotificationPriority.DEFAULT,
+    // Check if location services are enabled
+    const isLocationAvailable = await Location.hasServicesEnabledAsync();
+    console.log('Location services enabled:', isLocationAvailable);
+    if (!isLocationAvailable) {
+      console.warn('Location services are disabled on the device');
+      setError(language === 'fr' ? 'Les services de localisation sont désactivés sur votre appareil.' : 'Location services are disabled on your device.');
+      const backendLocation = await fetchUserLocation();
+      if (backendLocation && mapRef.current) {
+        mapRef.current.animateToRegion(
+          {
+            ...backendLocation,
+            latitudeDelta: 0.01,
+            longitudeDelta: 0.01,
           },
-          trigger: { seconds: 1 },
-        });
-        setCurrentAlert(alert);
-        setShowAlertModal(true);
+          1000
+        );
       }
-      previousZoneRef.current = foundZone;
+      return;
     }
-    setCurrentZone(foundZone);
-  };
 
-  const isPointInPolygon = (point: LocationCoords, polygon: LocationCoords[]): boolean => {
-    let inside = false;
-    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-      const xi = polygon[i].latitude;
-      const yi = polygon[i].longitude;
-      const xj = polygon[j].latitude;
-      const yj = polygon[j].longitude;
-      const intersect =
-        ((yi > point.longitude) !== (yj > point.longitude)) &&
-        point.latitude < ((xj - xi) * (point.longitude - yi)) / (yj - yi) + xi;
-      if (intersect) inside = !inside;
+    // Check and request permissions
+    const permissionStatus = await Location.getForegroundPermissionsAsync();
+    console.log('Current permission status:', permissionStatus);
+    if (permissionStatus.status !== 'granted') {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      console.log('Requested permission status:', status);
+      if (status !== 'granted') {
+        console.warn('Permission to access location denied');
+        setError(language === 'fr' ? 'Permission d\'accès à la localisation refusée. Vérifiez les paramètres de votre appareil.' : 'Permission to access location denied. Check your device settings.');
+        const backendLocation = await fetchUserLocation();
+        if (backendLocation && mapRef.current) {
+          mapRef.current.animateToRegion(
+            {
+              ...backendLocation,
+              latitudeDelta: 0.01,
+              longitudeDelta: 0.01,
+            },
+            1000
+          );
+        }
+        return;
+      }
     }
-    return inside;
-  };
 
-  const centerMapOnUser = (): void => {
-    if (userLocation && mapRef.current) {
+    // Attempt to get location with extended timeout and high accuracy
+    console.log('Attempting to get current position...');
+    let location;
+    try {
+      location = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.BestForNavigation,
+        timeInterval: 1000,
+        distanceInterval: 0,
+        maximumAge: 10000,
+        timeout: 15000, // 15 seconds timeout
+      });
+    } catch (locationError) {
+      console.error('Location error details:', locationError);
+      throw new Error(`Failed to get current position: ${locationError.message}`);
+    }
+
+    if (!location || !location.coords) {
+      console.error('No location data received');
+      throw new Error('No location data received');
+    }
+
+    const newLocation = {
+      latitude: location.coords.latitude,
+      longitude: location.coords.longitude,
+    };
+    console.log('Device location:', newLocation);
+    setUserLocation(newLocation);
+    await updateUserLocation(newLocation);
+    await determineCurrentZone(newLocation);
+    if (mapRef.current) {
       mapRef.current.animateToRegion(
         {
-          ...userLocation,
+          ...newLocation,
           latitudeDelta: 0.01,
           longitudeDelta: 0.01,
         },
         1000
       );
     }
-  };
+  } catch (error) {
+    console.error('Center map error:', error);
+    setError(
+      language === 'fr'
+        ? 'Échec de la localisation. Vérifiez le GPS, les permissions et la connexion réseau.'
+        : 'Failed to locate user. Check GPS, permissions, and network connection.'
+    );
+    const backendLocation = await fetchUserLocation();
+    if (backendLocation && mapRef.current) {
+      mapRef.current.animateToRegion(
+        {
+          ...backendLocation,
+          latitudeDelta: 0.01,
+          longitudeDelta: 0.01,
+        },
+        1000
+      );
+    }
+  }
+};
 
+const determineCurrentZone = async (coords: LocationCoords): Promise<void> => {
+  console.log('Determining current zone for coords:', coords);
+  if (!settings.notifications || !settings.locationAlerts) {
+    console.log('Notifications or location alerts disabled. Setting zone to unknown.');
+    setCurrentZone('unknown');
+    setCurrentZoneId(null);
+    setCurrentBeach(null);
+    setCurrentAlertMessage(language === 'fr' ? 'Aucune zone de plage à proximité' : 'No beach zones nearby');
+    return;
+  }
+
+  try {
+    console.log('Sending check-location request to backend...');
+    const response = await fetch(`${BASE_URL}/api/users/check-location`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({
+        deviceId,
+        latitude: coords.latitude,
+        longitude: coords.longitude,
+      }),
+    });
+    if (!response.ok) {
+      console.error('Backend check-location failed with status:', response.status, response.statusText);
+      throw new Error(`HTTP error: ${response.status}`);
+    }
+    const result = await response.json();
+    console.log('Backend zone check result:', result);
+
+    if (result.inside) {
+      setCurrentZone(result.zoneType);
+      setCurrentZoneId(result.zoneId);
+      setCurrentBeach({ id: result.beachId, name: result.beachName, city: 'Safi', description: '', zones: [] });
+      console.log(`Fetching alerts for beachId: ${result.beachId}`);
+      const alerts = await fetchAlerts(result.beachId);
+      console.log(`Alerts received:`, alerts);
+      const alert = alerts.find(a => {
+        const mappedType = mapAlertTypeToZoneType(a.type);
+        console.log(`Checking alert: ID=${a.id}, type=${a.type}, mappedType=${mappedType}, zoneId=${a.zoneId}`);
+        return mappedType === result.zoneType && a.zoneId === result.zoneId;
+      });
+      if (alert) {
+        console.log(`Found alert: ${alert.message} (ID: ${alert.id}, ZoneID: ${alert.zoneId})`);
+        setCurrentAlertMessage(alert.message);
+        if (Constants.appOwnership !== 'expo') {
+          try {
+            console.log('Attempting to schedule notification...');
+            await Notifications.scheduleNotificationAsync({
+              content: {
+                title: language === 'fr' ? 'Alerte Plage' : 'Beach Alert',
+                body: alert.message,
+                data: { zone: result.zoneType },
+                sound: settings.sounds ? 'default' : undefined,
+                vibrate: settings.vibrations ? [0, 250, 250, 250] : undefined,
+                priority: result.zoneType === 'danger' ? Notifications.AndroidImportance.HIGH : Notifications.AndroidNotificationPriority.DEFAULT,
+              },
+              trigger: { seconds: 1 },
+            });
+            console.log('Scheduled notification:', alert.message);
+          } catch (error) {
+            console.error('Failed to schedule notification:', error);
+          }
+        } else {
+          console.log('Running in Expo Go, skipping notification scheduling');
+        }
+      } else {
+        console.warn(`No alert found for ${result.zoneType} (zoneId: ${result.zoneId}) in beach ${result.beachName}`);
+        setCurrentAlertMessage(
+          result.zoneType === 'safe'
+            ? (language === 'fr' ? 'Conditions de baignade sécurisées' : 'Safe swimming conditions')
+            : result.zoneType === 'danger'
+            ? (language === 'fr' ? 'Conditions de baignade dangereuses. Évitez de nager.' : 'Dangerous swimming conditions. Avoid swimming.')
+            : (language === 'fr' ? 'Aucune alerte disponible' : 'No alert available')
+        );
+      }
+    } else {
+      console.log('User not inside any known zone');
+      setCurrentZone('unknown');
+      setCurrentZoneId(null);
+      setCurrentBeach(null);
+      setCurrentAlertMessage(language === 'fr' ? 'Aucune zone de plage à proximité' : 'No beach zones nearby');
+    }
+  } catch (error) {
+    console.error('Zone check error:', error);
+    setError(language === 'fr' ? 'Échec de la vérification de la zone. Vérifiez la connexion réseau.' : 'Failed to check zone. Check network connection.');
+    setCurrentZone('unknown');
+    setCurrentZoneId(null);
+    setCurrentBeach(null);
+    setCurrentAlertMessage(language === 'fr' ? 'Aucune zone de plage à proximité' : 'No beach zones nearby');
+  }
+};
   const toggleLegend = () => {
     setShowLegend(!showLegend);
   };
@@ -456,13 +579,13 @@ export default function MapScreen() {
     navigation.navigate('NotificationSettings');
   };
 
-  const getZoneMessage = (): string => {
-    const messages: Record<ZoneType, Record<LanguageType, string>> = {
-      safe: { fr: 'Zone de baignade sécurisée', en: 'Safe swimming zone' },
-      sport: { fr: 'Zone de sports nautiques', en: 'Water sports zone' },
-      danger: { fr: 'Zone dangereuse - Évitez', en: 'Dangerous zone - Avoid' },
-    };
-    return messages[currentZone][language];
+  const toggleLanguage = () => {
+    setLanguage(language === 'fr' ? 'en' : 'fr');
+  };
+
+  const testFetchAlerts = () => {
+    console.log('Manually triggering fetchAlerts for Safi Beach (ID: 2)');
+    fetchAlerts(2);
   };
 
   const getZoneIcon = (): IoniconName => {
@@ -470,39 +593,70 @@ export default function MapScreen() {
       safe: 'checkmark-circle',
       sport: 'fitness',
       danger: 'warning',
+      unknown: 'information-circle',
     };
     return icons[currentZone];
   };
 
   const getZoneColor = (zoneType: ZoneType): string => {
     const colors: Record<ZoneType, string> = {
-      safe: '#3b82f6', // Blue for BATHING
-      sport: '#ef4444', // Red for SPORTS
-      danger: '#ff0000', // Bright red for DANGER
+      safe: '#3b82f6',
+      sport: '#ef4444',
+      danger: '#ff0000',
+      unknown: '#6b7280',
     };
     return colors[zoneType];
   };
 
+  useEffect(() => {
+    if (currentBeach?.id) {
+      fetchAlerts(currentBeach.id);
+      const alertInterval = setInterval(() => fetchAlerts(currentBeach.id), 5 * 60 * 1000);
+      return () => clearInterval(alertInterval);
+    }
+  }, [currentBeach?.id]);
+
+  useEffect(() => {
+    if (showLegend) {
+      Animated.spring(legendAnimation, { toValue: 1, useNativeDriver: true, tension: 100, friction: 8 }).start();
+    } else {
+      Animated.spring(legendAnimation, { toValue: 0, useNativeDriver: true, tension: 100, friction: 8 }).start();
+    }
+  }, [showLegend]);
+
+  useEffect(() => {
+    if (showQuickActions) {
+      Animated.spring(quickActionsAnimation, { toValue: 1, useNativeDriver: true, tension: 100, friction: 8 }).start();
+    } else {
+      Animated.spring(quickActionsAnimation, { toValue: 0, useNativeDriver: true, tension: 100, friction: 8 }).start();
+    }
+  }, [showQuickActions]);
+
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: isDarkMode ? '#111827' : '#ffffff' }]}>
+    <SafeAreaView className={`flex-1 ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}>
       <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} backgroundColor={isDarkMode ? '#111827' : '#ffffff'} />
-      <View style={styles.header}>
-        <View style={styles.headerContent}>
-          <Ionicons name={getZoneIcon()} size={24} color={getZoneColor(currentZone)} style={styles.headerIcon} />
-          <Text style={[styles.headerText, { color: isDarkMode ? '#ffffff' : '#111827' }]} numberOfLines={1}>
-            {loading ? (language === 'fr' ? 'Chargement...' : 'Loading...') : error || getZoneMessage()}
+      <View className={`flex-row items-center justify-between px-4 py-2 ${isDarkMode ? 'bg-gray-800/80' : 'bg-gray-50'} shadow-sm`}>
+        <View className="flex-row items-center">
+          <Ionicons name={getZoneIcon()} size={20} color={getZoneColor(currentZone)} className="mr-2" />
+          <Text className={`text-sm font-medium ${isDarkMode ? 'text-white' : 'text-gray-900'}`} numberOfLines={1}>
+            {loading ? (language === 'fr' ? 'Chargement...' : 'Loading...') : error || currentAlertMessage || (language === 'fr' ? 'Aucune alerte disponible' : 'No alert available')}
           </Text>
         </View>
-        <View style={styles.headerButtons}>
-          <TouchableOpacity onPress={navigateToNotifications} style={[styles.iconButton, { backgroundColor: isDarkMode ? '#374151' : '#f3f4f6' }]}>
-            <Ionicons name="notifications-outline" size={20} color={isDarkMode ? '#ffffff' : '#6b7280'} />
+        <View className="flex-row items-center gap-2">
+          <TouchableOpacity onPress={navigateToNotifications} className={`p-2 rounded-full ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
+            <Ionicons name="notifications-outline" size={18} color={isDarkMode ? '#d1d5db' : '#6b7280'} />
           </TouchableOpacity>
-          <TouchableOpacity onPress={navigateToSafety} style={[styles.safetyButton, { backgroundColor: '#ef4444' }]}>
-            <Ionicons name="shield-checkmark" size={16} color="#ffffff" />
-            <Text style={styles.safetyButtonText}>{language === 'fr' ? 'Sécurité' : 'Safety'}</Text>
+          <TouchableOpacity onPress={navigateToSafety} className="flex-row items-center bg-red-500 px-3 py-1 rounded-full">
+            <Ionicons name="shield-checkmark" size={14} color="#ffffff" />
+            <Text className="text-white text-xs font-medium ml-1">{language === 'fr' ? 'Sécurité' : 'Safety'}</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={() => setIsDarkMode(!isDarkMode)} style={[styles.iconButton, { backgroundColor: isDarkMode ? '#374151' : '#f3f4f6' }]}>
-            <Ionicons name={isDarkMode ? 'sunny' : 'moon'} size={20} color={isDarkMode ? '#fbbf24' : '#6b7280'} />
+          <TouchableOpacity onPress={() => setIsDarkMode(!isDarkMode)} className={`p-2 rounded-full ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
+            <Ionicons name={isDarkMode ? 'sunny' : 'moon'} size={18} color={isDarkMode ? '#fbbf24' : '#6b7280'} />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={toggleLanguage} className={`px-3 py-1 rounded-full ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
+            <Text className={`text-xs font-medium ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
+              {language === 'fr' ? 'EN' : 'FR'}
+            </Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -518,143 +672,142 @@ export default function MapScreen() {
         customMapStyle={isDarkMode ? darkMapStyle : []}
       >
         {beaches.map((beach) =>
-          beach.zones.map((zone) =>
-            zone.coordinates.length >= 3 ? (
+          beach.zones.map((zone) => {
+            console.log(`Attempting to render polygon for ${beach.name} - ${zone.name || zone.type} (ID: ${zone.id}, Type: ${zone.type}):`, zone.coordinates);
+            return zone.coordinates.length >= 3 ? (
               <Polygon
                 key={`${beach.id}-${zone.id}`}
                 coordinates={zone.coordinates}
-                fillColor={`rgba(${zone.type === 'safe' ? '59, 130, 246' : zone.type === 'sport' ? '239, 68, 68' : '255, 0, 0'}, 0.3)`}
+                fillColor={`rgba(${zone.type === 'safe' ? '59, 130, 246' : zone.type === 'sport' ? '239, 68, 68' : '255, 0, 0'}, 0.5)`}
                 strokeColor={getZoneColor(zone.type)}
-                strokeWidth={2}
+                strokeWidth={3}
               />
-            ) : null
-          )
+            ) : (
+              console.warn(`Skipping polygon for ${beach.name} - ${zone.name || zone.type}: invalid coordinates`)
+            );
+          })
         )}
         {userLocation && (
           <Marker coordinate={userLocation} anchor={{ x: 0.5, y: 0.5 }}>
-            <View style={styles.marker} />
+            <View className="w-5 h-5 rounded-full bg-blue-500 border-2 border-white shadow-md" />
           </Marker>
         )}
       </MapView>
-      <View style={styles.floatingButtons}>
-        <TouchableOpacity onPress={centerMapOnUser} style={styles.floatingButton}>
-          <Ionicons name="locate" size={24} color="#ffffff" />
+      <View className="absolute bottom-28 right-4 gap-2">
+        <TouchableOpacity onPress={centerMapOnUser} className="w-12 h-12 rounded-full bg-blue-500 justify-center items-center shadow-lg">
+          <Ionicons name="locate" size={22} color="#ffffff" />
         </TouchableOpacity>
-        <TouchableOpacity onPress={toggleLegend} style={[styles.floatingButton, { backgroundColor: isDarkMode ? '#1f2937' : '#ffffff', borderWidth: isDarkMode ? 0 : 1, borderColor: '#e5e7eb' }]}>
-          <Ionicons name="information-circle" size={24} color={isDarkMode ? '#ffffff' : '#374151'} />
+        <TouchableOpacity onPress={toggleLegend} className={`w-12 h-12 rounded-full ${isDarkMode ? 'bg-gray-800' : 'bg-white'} border ${isDarkMode ? 'border-gray-700' : 'border-gray-200'} justify-center items-center shadow-lg`}>
+          <Ionicons name="information-circle" size={22} color={isDarkMode ? '#ffffff' : '#374151'} />
         </TouchableOpacity>
-        <TouchableOpacity onPress={toggleQuickActions} style={[styles.floatingButton, { backgroundColor: '#10b981', width: 64, height: 64, borderRadius: 32 }]}>
-          <Ionicons name={showQuickActions ? 'close' : 'menu'} size={28} color="#ffffff" />
+        <TouchableOpacity onPress={testFetchAlerts} className={`w-12 h-12 rounded-full ${isDarkMode ? 'bg-gray-800' : 'bg-white'} border ${isDarkMode ? 'border-gray-700' : 'border-gray-200'} justify-center items-center shadow-lg`}>
+          <Ionicons name="notifications" size={22} color={isDarkMode ? '#ffffff' : '#374151'} />
+        </TouchableOpacity>
+        <TouchableOpacity onPress={toggleQuickActions} className="w-14 h-14 rounded-full bg-emerald-500 justify-center items-center shadow-lg">
+          <Ionicons name={showQuickActions ? 'close' : 'menu'} size={24} color="#ffffff" />
         </TouchableOpacity>
       </View>
       {showQuickActions && (
-        <Animated.View style={[styles.quickActions, { transform: [{ scale: quickActionsAnimation.interpolate({ inputRange: [0, 1], outputRange: [0.8, 1] }) }, { translateY: quickActionsAnimation.interpolate({ inputRange: [0, 1], outputRange: [20, 0] }) }], opacity: quickActionsAnimation }]}>
-          <TouchableOpacity onPress={navigateToSafety} style={[styles.quickActionButton, { backgroundColor: '#ef4444' }]}>
-            <Ionicons name="shield-checkmark-outline" size={20} color="#ffffff" />
-            <Text style={styles.quickActionText}>{language === 'fr' ? 'Infos Sécurité' : 'Safety Info'}</Text>
+        <Animated.View
+          className="absolute bottom-44 right-4 gap-2"
+          style={{
+            transform: [
+              { scale: quickActionsAnimation.interpolate({ inputRange: [0, 1], outputRange: [0.8, 1] }) },
+              { translateY: quickActionsAnimation.interpolate({ inputRange: [0, 1], outputRange: [20, 0] }) },
+            ],
+            opacity: quickActionsAnimation,
+          }}
+        >
+          <TouchableOpacity onPress={navigateToSafety} className="flex-row items-center bg-red-500 px-4 py-2 rounded-xl shadow-md min-w-32">
+            <Ionicons name="shield-checkmark-outline" size={18} color="#ffffff" />
+            <Text className="text-white font-medium text-sm ml-2">{language === 'fr' ? 'Infos Sécurité' : 'Safety Info'}</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={navigateToNotifications} style={[styles.quickActionButton, { backgroundColor: '#8b5cf6' }]}>
-            <Ionicons name="notifications-outline" size={20} color="#ffffff" />
-            <Text style={styles.quickActionText}>{language === 'fr' ? 'Notifications' : 'Notifications'}</Text>
+          <TouchableOpacity onPress={navigateToNotifications} className="flex-row items-center bg-purple-500 px-4 py-2 rounded-xl shadow-md min-w-32">
+            <Ionicons name="notifications-outline" size={18} color="#ffffff" />
+            <Text className="text-white font-medium text-sm ml-2">{language === 'fr' ? 'Notifications' : 'Notifications'}</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={() => Linking.openURL('tel:112')} style={[styles.quickActionButton, { backgroundColor: '#f59e0b' }]}>
-            <Ionicons name="call-outline" size={20} color="#ffffff" />
-            <Text style={styles.quickActionText}>{language === 'fr' ? 'Urgence' : 'Emergency'}</Text>
+          <TouchableOpacity onPress={() => Linking.openURL('tel:112')} className="flex-row items-center bg-amber-500 px-4 py-2 rounded-xl shadow-md min-w-32">
+            <Ionicons name="call-outline" size={18} color="#ffffff" />
+            <Text className="text-white font-medium text-sm ml-2">{language === 'fr' ? 'Urgence' : 'Emergency'}</Text>
           </TouchableOpacity>
         </Animated.View>
       )}
-      <View style={styles.footer}>
-        <View style={styles.footerContent}>
-          <Text style={[styles.footerText, { color: isDarkMode ? '#ffffff' : '#111827', opacity: 0.7 }]}>
+      <View className={`absolute bottom-0 left-0 right-0 px-4 py-2 ${isDarkMode ? 'bg-gray-800/80' : 'bg-gray-50'} flex-row justify-between items-center shadow-sm`}>
+        <View>
+          <Text className={`text-xs ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
             {language === 'fr' ? 'Besoin d\'aide?' : 'Need help?'}
           </Text>
-          <Text style={[styles.footerText, { color: isDarkMode ? '#ffffff' : '#111827', fontWeight: '600' }]}>
+          <Text className={`text-xs font-medium ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
             {language === 'fr' ? 'Consultez nos conseils de sécurité' : 'Check our safety guidelines'}
           </Text>
         </View>
-        <TouchableOpacity onPress={navigateToSafety} style={styles.guideButton}>
-          <Ionicons name="book-outline" size={16} color="#ffffff" />
-          <Text style={styles.guideButtonText}>{language === 'fr' ? 'Guide' : 'Guide'}</Text>
+        <TouchableOpacity onPress={navigateToSafety} className="flex-row items-center bg-blue-500 px-3 py-1 rounded-xl">
+          <Ionicons name="book-outline" size={14} color="#ffffff" />
+          <Text className="text-white font-medium text-xs ml-1">{language === 'fr' ? 'Guide' : 'Guide'}</Text>
         </TouchableOpacity>
       </View>
       {error && (
         <Modal transparent={true} animationType="fade" visible={!!error}>
-          <View style={styles.modalContainer}>
-            <View style={[styles.modalContent, { backgroundColor: isDarkMode ? '#1f2937' : '#ffffff' }]}>
-              <Ionicons name="warning" size={40} color="#ef4444" style={styles.modalIcon} />
-              <Text style={[styles.modalText, { color: isDarkMode ? '#ffffff' : '#111827' }]}>{error}</Text>
-              <View style={styles.modalButtons}>
-                <TouchableOpacity onPress={() => { setError(null); fetchBeaches(); fetchAlerts(1); }} style={[styles.modalButton, { backgroundColor: '#3b82f6' }]}>
-                  <Text style={styles.modalButtonText}>{language === 'fr' ? 'Réessayer' : 'Retry'}</Text>
+          <View className="flex-1 justify-center items-center bg-black/50">
+            <View className={`rounded-xl p-4 w-4/5 ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}>
+              <Ionicons name="warning" size={32} color="#ef4444" className="mb-2 self-center" />
+              <Text className={`text-sm text-center ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>{error}</Text>
+              <View className="flex-row gap-2 mt-4">
+                <TouchableOpacity onPress={() => { fetchBeaches(); if (currentBeach?.id) fetchAlerts(currentBeach.id); getUserLocation(); }} className="flex-1 bg-blue-500 py-2 rounded-lg">
+                  <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Réessayer Tout' : 'Retry All'}</Text>
                 </TouchableOpacity>
-                <TouchableOpacity onPress={() => setError(null)} style={[styles.modalButton, { backgroundColor: '#6b7280' }]}>
-                  <Text style={styles.modalButtonText}>{language === 'fr' ? 'Fermer' : 'Close'}</Text>
+                <TouchableOpacity onPress={() => currentBeach?.id && fetchAlerts(currentBeach.id)} className="flex-1 bg-emerald-500 py-2 rounded-lg">
+                  <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Réessayer Alertes' : 'Retry Alerts'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => setError(null)} className="flex-1 bg-gray-500 py-2 rounded-lg">
+                  <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Fermer' : 'Close'}</Text>
                 </TouchableOpacity>
               </View>
-            </View>
-          </View>
-        </Modal>
-      )}
-      {showAlertModal && currentAlert && (
-        <Modal transparent={true} animationType="fade" visible={showAlertModal}>
-          <View style={styles.modalContainer}>
-            <View style={[styles.modalContent, { backgroundColor: isDarkMode ? '#1f2937' : '#ffffff' }]}>
-              <Ionicons
-                name={mapAlertTypeToZoneType(currentAlert.type) === 'danger' ? 'warning' : 'checkmark-circle'}
-                size={40}
-                color={mapAlertTypeToZoneType(currentAlert.type) === 'danger' ? '#ef4444' : '#3b82f6'}
-                style={styles.modalIcon}
-              />
-              <Text style={[styles.modalTitle, { color: isDarkMode ? '#ffffff' : '#111827' }]}>
-                {language === 'fr' ? 'Alerte Plage' : 'Beach Alert'}
-              </Text>
-              <Text style={[styles.modalText, { color: isDarkMode ? '#ffffff' : '#111827' }]}>{currentAlert.message}</Text>
-              <TouchableOpacity onPress={() => { setShowAlertModal(false); setCurrentAlert(null); }} style={[styles.modalButton, { backgroundColor: '#3b82f6' }]}>
-                <Text style={styles.modalButtonText}>{language === 'fr' ? 'OK' : 'OK'}</Text>
-              </TouchableOpacity>
             </View>
           </View>
         </Modal>
       )}
       {showLegend && (
-        <View style={styles.legendContainer}>
-          <TouchableOpacity style={{ flex: 1 }} onPress={() => setShowLegend(false)} />
-          <Animated.View style={[styles.legendContent, { backgroundColor: isDarkMode ? '#1f2937' : '#ffffff', transform: [{ translateY: legendAnimation.interpolate({ inputRange: [0, 1], outputRange: [300, 0] }) }] }]}>
-            <View style={[styles.legendHandle, { backgroundColor: isDarkMode ? '#4b5563' : '#d1d5db' }]} />
-            <Text style={[styles.legendTitle, { color: isDarkMode ? '#ffffff' : '#111827' }]}>
+        <View className="absolute bottom-0 left-0 right-0 bg-black/50 justify-end">
+          <Animated.View
+            className={`rounded-t-2xl px-4 py-5 ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}
+            style={{ transform: [{ translateY: legendAnimation.interpolate({ inputRange: [0, 1], outputRange: [300, 0] }) }] }}
+          >
+            <View className={`w-8 h-1 rounded-full ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'} self-center mb-4`} />
+            <Text className={`text-base font-medium text-center ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
               {language === 'fr' ? 'Légende des zones' : 'Zone Legend'}
             </Text>
-            <View style={styles.legendItems}>
-              <View style={styles.legendItem}>
-                <View style={[styles.legendColor, { backgroundColor: '#3b82f6' }]} />
-                <Text style={[styles.legendText, { color: isDarkMode ? '#ffffff' : '#111827' }]}>
+            <View className="gap-3 mt-4">
+              <View className="flex-row items-center">
+                <View className="w-4 h-4 rounded bg-blue-500 mr-2" />
+                <Text className={`text-sm ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
                   {language === 'fr' ? 'Zone de baignade (sécurisée)' : 'Swimming zone (safe)'}
                 </Text>
               </View>
-              <View style={styles.legendItem}>
-                <View style={[styles.legendColor, { backgroundColor: '#ef4444' }]} />
-                <Text style={[styles.legendText, { color: isDarkMode ? '#ffffff' : '#111827' }]}>
+              <View className="flex-row items-center">
+                <View className="w-4 h-4 rounded bg-red-500 mr-2" />
+                <Text className={`text-sm ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
                   {language === 'fr' ? 'Zone de sports nautiques (kite, windsurf)' : 'Water sports zone (kite, windsurf)'}
                 </Text>
               </View>
-              <View style={styles.legendItem}>
-                <View style={[styles.legendColor, { backgroundColor: '#ff0000' }]} />
-                <Text style={[styles.legendText, { color: isDarkMode ? '#ffffff' : '#111827' }]}>
+              <View className="flex-row items-center">
+                <View className="w-4 h-4 rounded bg-red-600 mr-2" />
+                <Text className={`text-sm ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
                   {language === 'fr' ? 'Zone dangereuse (éviter)' : 'Dangerous zone (avoid)'}
                 </Text>
               </View>
             </View>
-            <View style={styles.legendButtons}>
-              <TouchableOpacity onPress={navigateToSafety} style={[styles.legendButton, { backgroundColor: '#ef4444' }]}>
-                <Ionicons name="shield-checkmark" size={16} color="#ffffff" />
-                <Text style={styles.legendButtonText}>{language === 'fr' ? 'Sécurité' : 'Safety'}</Text>
+            <View className="flex-row gap-2 mt-5">
+              <TouchableOpacity onPress={navigateToSafety} className="flex-1 bg-red-500 py-2 rounded-lg flex-row justify-center items-center">
+                <Ionicons name="shield-checkmark" size={14} color="#ffffff" />
+                <Text className="text-white text-xs font-medium ml-1">{language === 'fr' ? 'Sécurité' : 'Safety'}</Text>
               </TouchableOpacity>
-              <TouchableOpacity onPress={navigateToNotifications} style={[styles.legendButton, { backgroundColor: '#8b5cf6' }]}>
-                <Ionicons name="notifications" size={16} color="#ffffff" />
-                <Text style={styles.legendButtonText}>{language === 'fr' ? 'Alertes' : 'Alerts'}</Text>
+              <TouchableOpacity onPress={navigateToNotifications} className="flex-1 bg-purple-500 py-2 rounded-lg flex-row justify-center items-center">
+                <Ionicons name="notifications" size={14} color="#ffffff" />
+                <Text className="text-white text-xs font-medium ml-1">{language === 'fr' ? 'Alertes' : 'Alerts'}</Text>
               </TouchableOpacity>
-              <TouchableOpacity onPress={() => setShowLegend(false)} style={[styles.legendButton, { backgroundColor: '#3b82f6' }]}>
-                <Text style={styles.legendButtonText}>{language === 'fr' ? 'Fermer' : 'Close'}</Text>
+              <TouchableOpacity onPress={() => setShowLegend(false)} className="flex-1 bg-blue-500 py-2 rounded-lg">
+                <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Fermer' : 'Close'}</Text>
               </TouchableOpacity>
             </View>
           </Animated.View>
@@ -665,246 +818,7 @@ export default function MapScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1 },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    backgroundColor: '#1f2937',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
-  },
-  headerContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  headerIcon: { marginRight: 8 },
-  headerText: {
-    fontSize: 16,
-    fontWeight: '600',
-    flex: 1,
-  },
-  headerButtons: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  iconButton: {
-    padding: 8,
-    borderRadius: 20,
-  },
-  safetyButton: {
-    padding: 8,
-    borderRadius: 20,
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-  },
-  safetyButtonText: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: '600',
-    marginLeft: 4,
-  },
   map: { flex: 1 },
-  marker: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    backgroundColor: '#3b82f6',
-    borderWidth: 3,
-    borderColor: '#ffffff',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.3,
-    shadowRadius: 4,
-    elevation: 5,
-  },
-  floatingButtons: {
-    position: 'absolute',
-    bottom: 120,
-    right: 16,
-    gap: 12,
-  },
-  floatingButton: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
-    backgroundColor: '#3b82f6',
-    justifyContent: 'center',
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 8,
-  },
-  quickActions: {
-    position: 'absolute',
-    bottom: 200,
-    right: 16,
-    gap: 12,
-  },
-  quickActionButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderRadius: 24,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.2,
-    shadowRadius: 8,
-    elevation: 6,
-    minWidth: 140,
-  },
-  quickActionText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '600',
-    marginLeft: 8,
-  },
-  footer: {
-    position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    backgroundColor: '#1f2937',
-    paddingHorizontal: 20,
-    paddingVertical: 16,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: -2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 8,
-    borderTopWidth: 1,
-    borderTopColor: '#374151',
-  },
-  footerContent: { flex: 1 },
-  footerText: { fontSize: 14 },
-  guideButton: {
-    backgroundColor: '#3b82f6',
-    paddingVertical: 10,
-    paddingHorizontal: 20,
-    borderRadius: 20,
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  guideButtonText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '600',
-    marginLeft: 6,
-  },
-  modalContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
-  },
-  modalContent: {
-    borderRadius: 12,
-    padding: 20,
-    width: width * 0.8,
-    alignItems: 'center',
-  },
-  modalIcon: { marginBottom: 10 },
-  modalTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    textAlign: 'center',
-  },
-  modalText: {
-    fontSize: 16,
-    textAlign: 'center',
-    marginVertical: 10,
-  },
-  modalButtons: {
-    flexDirection: 'row',
-    gap: 10,
-    marginTop: 20,
-  },
-  modalButton: {
-    paddingVertical: 10,
-    paddingHorizontal: 20,
-    borderRadius: 8,
-  },
-  modalButtonText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  legendContainer: {
-    position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
-    justifyContent: 'flex-end',
-  },
-  legendContent: {
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    paddingHorizontal: 20,
-    paddingVertical: 24,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: -4 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 8,
-  },
-  legendHandle: {
-    width: 40,
-    height: 4,
-    borderRadius: 2,
-    alignSelf: 'center',
-    marginBottom: 20,
-  },
-  legendTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    marginBottom: 20,
-    textAlign: 'center',
-  },
-  legendItems: { gap: 16 },
-  legendItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  legendColor: {
-    width: 20,
-    height: 20,
-    borderRadius: 4,
-    marginRight: 12,
-  },
-  legendText: { fontSize: 16 },
-  legendButtons: {
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 24,
-  },
-  legendButton: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 12,
-    alignItems: 'center',
-    flexDirection: 'row',
-    justifyContent: 'center',
-  },
-  legendButtonText: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: '600',
-    marginLeft: 4,
-  },
 });
 
 const darkMapStyle = [
