@@ -1,52 +1,35 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { createContext, useContext, useState } from 'react';
 
-interface Settings {
+type Settings = {
   notifications: boolean;
   locationAlerts: boolean;
-  dailyTips: boolean;
   sounds: boolean;
   vibrations: boolean;
-}
+};
 
-interface SettingsContextType {
+const SettingsContext = createContext<{
   settings: Settings;
   updateSettings: (newSettings: Partial<Settings>) => void;
-}
+}>({
+  settings: {
+    notifications: true,
+    locationAlerts: true,
+    sounds: true,
+    vibrations: true,
+  },
+  updateSettings: () => {},
+});
 
-const SettingsContext = createContext<SettingsContextType | undefined>(undefined);
-
-export const SettingsProvider = ({ children }: { children: ReactNode }) => {
+export function SettingsProvider({ children }: { children: React.ReactNode }) {
   const [settings, setSettings] = useState<Settings>({
     notifications: true,
     locationAlerts: true,
-    dailyTips: false,
     sounds: true,
     vibrations: true,
   });
 
-  useEffect(() => {
-    const loadSettings = async () => {
-      try {
-        const savedSettings = await AsyncStorage.getItem('settings');
-        if (savedSettings) {
-          setSettings(JSON.parse(savedSettings));
-        }
-      } catch (error) {
-        console.error('Failed to load settings from AsyncStorage:', error);
-      }
-    };
-    loadSettings();
-  }, []);
-
-  const updateSettings = async (newSettings: Partial<Settings>) => {
-    try {
-      const updatedSettings = { ...settings, ...newSettings };
-      setSettings(updatedSettings);
-      await AsyncStorage.setItem('settings', JSON.stringify(updatedSettings));
-    } catch (error) {
-      console.error('Failed to save settings to AsyncStorage:', error);
-    }
+  const updateSettings = (newSettings: Partial<Settings>) => {
+    setSettings((prev) => ({ ...prev, ...newSettings }));
   };
 
   return (
@@ -54,12 +37,6 @@ export const SettingsProvider = ({ children }: { children: ReactNode }) => {
       {children}
     </SettingsContext.Provider>
   );
-};
+}
 
-export const useSettings = () => {
-  const context = useContext(SettingsContext);
-  if (!context) {
-    throw new Error('useSettings must be used within a SettingsProvider');
-  }
-  return context;
-};
+export const useSettings = () => useContext(SettingsContext);

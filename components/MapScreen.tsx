@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, Component } from 'react';
 import {
   View,
   Text,
@@ -11,6 +11,7 @@ import {
   Linking,
   StyleSheet,
   Modal,
+  Alert,
 } from 'react-native';
 import MapView, { Marker, Polygon, PROVIDER_GOOGLE } from 'react-native-maps';
 import { Ionicons } from '@expo/vector-icons';
@@ -76,16 +77,40 @@ interface User {
 }
 
 const { width } = Dimensions.get('window');
-const BASE_URL = 'http://192.168.1.6:8080';
-const USE_MOCK_LOCATION = false; // Set to false to use device GPS
+const BASE_URL = 'http://192.168.1.2:8080';
+const USE_MOCK_LOCATION = false;
 
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-  }),
-});
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+}
+
+class ErrorBoundary extends Component<ErrorBoundaryProps, { hasError: boolean; error: Error | null }> {
+  state = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#ffffff' }}>
+          <Ionicons name="warning" size={48} color="#ef4444" />
+          <Text style={{ fontSize: 16, color: '#1f2937', marginVertical: 10 }}>
+            An error occurred: {this.state.error?.message || 'Unknown error'}
+          </Text>
+          <TouchableOpacity
+            style={{ backgroundColor: '#3b82f6', padding: 10, borderRadius: 8 }}
+            onPress={() => this.setState({ hasError: false, error: null })}
+          >
+            <Text style={{ color: '#ffffff', fontWeight: '600' }}>Retry</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 export default function MapScreen() {
   const { settings } = useSettings();
@@ -102,7 +127,8 @@ export default function MapScreen() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
-  const [deviceId, setDeviceId] = useState<string>(Constants.installationId || 'test-device');
+  const [mapError, setMapError] = useState<string | null>(null);
+  const [deviceId] = useState<string>(Constants.installationId || `test-device-${Math.random().toString(36).substring(2, 8)}`);
   const mapRef = useRef<MapView>(null);
   const legendAnimation = useRef(new Animated.Value(0)).current;
   const quickActionsAnimation = useRef(new Animated.Value(0)).current;
@@ -110,7 +136,7 @@ export default function MapScreen() {
   const previousZoneRef = useRef<ZoneType | null>(null);
 
   const initialRegion = {
-    latitude: 32.299507, // Safi
+    latitude: 32.299507,
     longitude: -9.237183,
     latitudeDelta: 0.01,
     longitudeDelta: 0.01,
@@ -119,33 +145,20 @@ export default function MapScreen() {
   useEffect(() => {
     console.log('Settings:', settings);
     console.log('Device ID:', deviceId);
-    if (Constants.appOwnership === 'expo') {
-      console.warn('Notifications disabled in Expo Go');
-    }
-    const setupNotifications = async () => {
-      if (!settings.notifications) return;
+    // Check FCM token
+    async function checkFCMToken() {
       try {
-        const { status } = await Notifications.requestPermissionsAsync();
-        if (status !== 'granted') {
-          console.warn('Notification permissions denied');
-          return;
-        }
-        if (Platform.OS === 'android' && settings.sounds) {
-          await Notifications.setNotificationChannelAsync('default', {
-            name: 'default',
-            importance: Notifications.AndroidImportance.HIGH,
-            vibrationPattern: settings.vibrations ? [0, 250, 250, 250] : undefined,
-            lightColor: '#FF231F7C',
-          });
-        }
+        const token = await Notifications.getDevicePushTokenAsync();
+        console.log('FCM Token:', token);
       } catch (error) {
-        console.error('Error setting up notifications:', error);
+        console.error('FCM Token Error:', error);
+        setError(language === 'fr' ? 'Échec de récupération du jeton FCM.' : 'Failed to fetch FCM token.');
       }
-    };
-    setupNotifications();
+    }
+    checkFCMToken();
     fetchBeaches();
     getUserLocation();
-  }, [settings.notifications, settings.sounds, settings.vibrations]);
+  }, [settings.locationAlerts]);
 
   const mapZoneType = (backendType: string): ZoneType => {
     const type = backendType.toUpperCase();
@@ -237,12 +250,14 @@ export default function MapScreen() {
       const response = await fetch(`${BASE_URL}/api/alerts/beach/${beachId}`, {
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       });
+      if (response.status === 204) {
+        console.log(`No alerts for beachId ${beachId}`);
+        setAlerts([]);
+        return [];
+      }
       if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
       const data: Alert[] = await response.json();
       console.log('Fetched alerts:', JSON.stringify(data, null, 2));
-      if (data.length === 0) {
-        console.warn(`No alerts found for beachId ${beachId}`);
-      }
       setAlerts(data);
       return data;
     } catch (err: any) {
@@ -327,7 +342,11 @@ export default function MapScreen() {
         await fetchUserLocation();
         return;
       }
-      let location = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      let location = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.BestForNavigation,
+        timeout: 30000,
+      });
+      console.log('Raw location data:', location);
       const newLocation = {
         latitude: location.coords.latitude,
         longitude: location.coords.longitude,
@@ -343,57 +362,33 @@ export default function MapScreen() {
     }
   };
 
-const centerMapOnUser = async (): Promise<void> => {
-  try {
-    console.log('Centering map on user location...');
-    if (USE_MOCK_LOCATION) {
-      console.log('Using mock location for Safi Bathing Zone');
-      const mockLocation = { latitude: 32.299507, longitude: -9.237183 };
-      setUserLocation(mockLocation);
-      await updateUserLocation(mockLocation);
-      await determineCurrentZone(mockLocation);
-      if (mapRef.current) {
-        mapRef.current.animateToRegion(
-          {
-            ...mockLocation,
-            latitudeDelta: 0.01,
-            longitudeDelta: 0.01,
-          },
-          1000
-        );
+  const centerMapOnUser = async (): Promise<void> => {
+    try {
+      console.log('Centering map on user location...');
+      if (USE_MOCK_LOCATION) {
+        console.log('Using mock location for Safi Bathing Zone');
+        const mockLocation = { latitude: 32.299507, longitude: -9.237183 };
+        setUserLocation(mockLocation);
+        await updateUserLocation(mockLocation);
+        await determineCurrentZone(mockLocation);
+        if (mapRef.current) {
+          mapRef.current.animateToRegion(
+            {
+              ...mockLocation,
+              latitudeDelta: 0.01,
+              longitudeDelta: 0.01,
+            },
+            1000
+          );
+        }
+        return;
       }
-      return;
-    }
 
-    // Check if location services are enabled
-    const isLocationAvailable = await Location.hasServicesEnabledAsync();
-    console.log('Location services enabled:', isLocationAvailable);
-    if (!isLocationAvailable) {
-      console.warn('Location services are disabled on the device');
-      setError(language === 'fr' ? 'Les services de localisation sont désactivés sur votre appareil.' : 'Location services are disabled on your device.');
-      const backendLocation = await fetchUserLocation();
-      if (backendLocation && mapRef.current) {
-        mapRef.current.animateToRegion(
-          {
-            ...backendLocation,
-            latitudeDelta: 0.01,
-            longitudeDelta: 0.01,
-          },
-          1000
-        );
-      }
-      return;
-    }
-
-    // Check and request permissions
-    const permissionStatus = await Location.getForegroundPermissionsAsync();
-    console.log('Current permission status:', permissionStatus);
-    if (permissionStatus.status !== 'granted') {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      console.log('Requested permission status:', status);
-      if (status !== 'granted') {
-        console.warn('Permission to access location denied');
-        setError(language === 'fr' ? 'Permission d\'accès à la localisation refusée. Vérifiez les paramètres de votre appareil.' : 'Permission to access location denied. Check your device settings.');
+      const isLocationAvailable = await Location.hasServicesEnabledAsync();
+      console.log('Location services enabled:', isLocationAvailable);
+      if (!isLocationAvailable) {
+        console.warn('Location services are disabled on the device');
+        setError(language === 'fr' ? 'Les services de localisation sont désactivés sur votre appareil.' : 'Location services are disabled on your device.');
         const backendLocation = await fetchUserLocation();
         if (backendLocation && mapRef.current) {
           mapRef.current.animateToRegion(
@@ -407,159 +402,176 @@ const centerMapOnUser = async (): Promise<void> => {
         }
         return;
       }
-    }
 
-    // Attempt to get location with extended timeout and high accuracy
-    console.log('Attempting to get current position...');
-    let location;
-    try {
-      location = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.BestForNavigation,
-        timeInterval: 1000,
-        distanceInterval: 0,
-        maximumAge: 10000,
-        timeout: 15000, // 15 seconds timeout
-      });
-    } catch (locationError) {
-      console.error('Location error details:', locationError);
-      throw new Error(`Failed to get current position: ${locationError.message}`);
-    }
-
-    if (!location || !location.coords) {
-      console.error('No location data received');
-      throw new Error('No location data received');
-    }
-
-    const newLocation = {
-      latitude: location.coords.latitude,
-      longitude: location.coords.longitude,
-    };
-    console.log('Device location:', newLocation);
-    setUserLocation(newLocation);
-    await updateUserLocation(newLocation);
-    await determineCurrentZone(newLocation);
-    if (mapRef.current) {
-      mapRef.current.animateToRegion(
-        {
-          ...newLocation,
-          latitudeDelta: 0.01,
-          longitudeDelta: 0.01,
-        },
-        1000
-      );
-    }
-  } catch (error) {
-    console.error('Center map error:', error);
-    setError(
-      language === 'fr'
-        ? 'Échec de la localisation. Vérifiez le GPS, les permissions et la connexion réseau.'
-        : 'Failed to locate user. Check GPS, permissions, and network connection.'
-    );
-    const backendLocation = await fetchUserLocation();
-    if (backendLocation && mapRef.current) {
-      mapRef.current.animateToRegion(
-        {
-          ...backendLocation,
-          latitudeDelta: 0.01,
-          longitudeDelta: 0.01,
-        },
-        1000
-      );
-    }
-  }
-};
-
-const determineCurrentZone = async (coords: LocationCoords): Promise<void> => {
-  console.log('Determining current zone for coords:', coords);
-  if (!settings.notifications || !settings.locationAlerts) {
-    console.log('Notifications or location alerts disabled. Setting zone to unknown.');
-    setCurrentZone('unknown');
-    setCurrentZoneId(null);
-    setCurrentBeach(null);
-    setCurrentAlertMessage(language === 'fr' ? 'Aucune zone de plage à proximité' : 'No beach zones nearby');
-    return;
-  }
-
-  try {
-    console.log('Sending check-location request to backend...');
-    const response = await fetch(`${BASE_URL}/api/users/check-location`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({
-        deviceId,
-        latitude: coords.latitude,
-        longitude: coords.longitude,
-      }),
-    });
-    if (!response.ok) {
-      console.error('Backend check-location failed with status:', response.status, response.statusText);
-      throw new Error(`HTTP error: ${response.status}`);
-    }
-    const result = await response.json();
-    console.log('Backend zone check result:', result);
-
-    if (result.inside) {
-      setCurrentZone(result.zoneType);
-      setCurrentZoneId(result.zoneId);
-      setCurrentBeach({ id: result.beachId, name: result.beachName, city: 'Safi', description: '', zones: [] });
-      console.log(`Fetching alerts for beachId: ${result.beachId}`);
-      const alerts = await fetchAlerts(result.beachId);
-      console.log(`Alerts received:`, alerts);
-      const alert = alerts.find(a => {
-        const mappedType = mapAlertTypeToZoneType(a.type);
-        console.log(`Checking alert: ID=${a.id}, type=${a.type}, mappedType=${mappedType}, zoneId=${a.zoneId}`);
-        return mappedType === result.zoneType && a.zoneId === result.zoneId;
-      });
-      if (alert) {
-        console.log(`Found alert: ${alert.message} (ID: ${alert.id}, ZoneID: ${alert.zoneId})`);
-        setCurrentAlertMessage(alert.message);
-        if (Constants.appOwnership !== 'expo') {
-          try {
-            console.log('Attempting to schedule notification...');
-            await Notifications.scheduleNotificationAsync({
-              content: {
-                title: language === 'fr' ? 'Alerte Plage' : 'Beach Alert',
-                body: alert.message,
-                data: { zone: result.zoneType },
-                sound: settings.sounds ? 'default' : undefined,
-                vibrate: settings.vibrations ? [0, 250, 250, 250] : undefined,
-                priority: result.zoneType === 'danger' ? Notifications.AndroidImportance.HIGH : Notifications.AndroidNotificationPriority.DEFAULT,
+      const permissionStatus = await Location.getForegroundPermissionsAsync();
+      console.log('Current permission status:', permissionStatus);
+      if (permissionStatus.status !== 'granted') {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        console.log('Requested permission status:', status);
+        if (status !== 'granted') {
+          console.warn('Permission to access location denied');
+          setError(language === 'fr' ? 'Permission d\'accès à la localisation refusée. Vérifiez les paramètres de votre appareil.' : 'Permission to access location denied. Check your device settings.');
+          const backendLocation = await fetchUserLocation();
+          if (backendLocation && mapRef.current) {
+            mapRef.current.animateToRegion(
+              {
+                ...backendLocation,
+                latitudeDelta: 0.01,
+                longitudeDelta: 0.01,
               },
-              trigger: { seconds: 1 },
-            });
-            console.log('Scheduled notification:', alert.message);
-          } catch (error) {
-            console.error('Failed to schedule notification:', error);
+              1000
+            );
           }
-        } else {
-          console.log('Running in Expo Go, skipping notification scheduling');
+          return;
         }
-      } else {
-        console.warn(`No alert found for ${result.zoneType} (zoneId: ${result.zoneId}) in beach ${result.beachName}`);
-        setCurrentAlertMessage(
-          result.zoneType === 'safe'
-            ? (language === 'fr' ? 'Conditions de baignade sécurisées' : 'Safe swimming conditions')
-            : result.zoneType === 'danger'
-            ? (language === 'fr' ? 'Conditions de baignade dangereuses. Évitez de nager.' : 'Dangerous swimming conditions. Avoid swimming.')
-            : (language === 'fr' ? 'Aucune alerte disponible' : 'No alert available')
+      }
+
+      console.log('Attempting to get current position...');
+      let location;
+      try {
+        location = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.BestForNavigation,
+          timeInterval: 1000,
+          distanceInterval: 0,
+          maximumAge: 10000,
+          timeout: 15000,
+        });
+      } catch (locationError) {
+        console.error('Location error details:', locationError);
+        throw new Error(`Failed to get current position: ${locationError.message}`);
+      }
+
+      if (!location || !location.coords) {
+        console.error('No location data received');
+        throw new Error('No location data received');
+      }
+
+      const newLocation = {
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+      };
+      console.log('Device location:', newLocation);
+      setUserLocation(newLocation);
+      await updateUserLocation(newLocation);
+      await determineCurrentZone(newLocation);
+      if (mapRef.current) {
+        mapRef.current.animateToRegion(
+          {
+            ...newLocation,
+            latitudeDelta: 0.01,
+            longitudeDelta: 0.01,
+          },
+          1000
         );
       }
-    } else {
-      console.log('User not inside any known zone');
+    } catch (error) {
+      console.error('Center map error:', error);
+      setError(
+        language === 'fr'
+          ? 'Échec de la localisation. Vérifiez le GPS, les permissions et la connexion réseau.'
+          : 'Failed to locate user. Check GPS, permissions, and network connection.'
+      );
+      const backendLocation = await fetchUserLocation();
+      if (backendLocation && mapRef.current) {
+        mapRef.current.animateToRegion(
+          {
+            ...backendLocation,
+            latitudeDelta: 0.01,
+            longitudeDelta: 0.01,
+          },
+          1000
+        );
+      }
+    }
+  };
+
+  const determineCurrentZone = async (coords: LocationCoords): Promise<void> => {
+    console.log('Determining current zone for coords:', coords);
+    if (!settings.locationAlerts) {
+      console.log('Location alerts disabled. Setting zone to unknown.');
+      setCurrentZone('unknown');
+      setCurrentZoneId(null);
+      setCurrentBeach(null);
+      setCurrentAlertMessage(language === 'fr' ? 'Aucune zone de plage à proximité' : 'No beach zones nearby');
+      return;
+    }
+
+    try {
+      console.log('Sending check-location request to:', `${BASE_URL}/api/users/check-location`);
+      const response = await fetch(`${BASE_URL}/api/users/check-location`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+          deviceId,
+          latitude: coords.latitude,
+          longitude: coords.longitude,
+        }),
+      });
+      console.log('Response status:', response.status, 'Status text:', response.statusText);
+      const responseText = await response.text();
+      console.log('Raw response:', responseText);
+      if (!response.ok) {
+        console.error('Backend check-location failed:', response.status, response.statusText);
+        throw new Error(`HTTP error: ${response.status} - ${responseText}`);
+      }
+      const result = JSON.parse(responseText);
+      console.log('Parsed zone check result:', result);
+
+      if (result.inside) {
+        const zoneType = mapZoneType(result.zoneType);
+        setCurrentZone(zoneType);
+        setCurrentZoneId(result.zoneId);
+        setCurrentBeach({ id: result.beachId, name: result.beachName, city: 'Safi', description: '', zones: [] });
+        console.log(`Fetching alerts for beachId: ${result.beachId}`);
+        const alerts = await fetchAlerts(result.beachId);
+        console.log(`Alerts received:`, alerts);
+        const alert = alerts.find(a => {
+          const mappedType = mapAlertTypeToZoneType(a.type);
+          console.log(`Checking alert: ID=${a.id}, type=${a.type}, mappedType=${mappedType}, zoneId=${a.zoneId}`);
+          return mappedType === zoneType && a.zoneId === result.zoneId;
+        });
+        if (alert) {
+          console.log(`Found alert: ${alert.message} (ID: ${alert.id}, ZoneID: ${alert.zoneId})`);
+          setCurrentAlertMessage(alert.message);
+          if (settings.locationAlerts) {
+            Alert.alert(
+              language === 'fr' ? 'Alerte Plage' : 'Beach Alert',
+              alert.message
+            );
+          }
+        } else {
+          console.warn(`No alert found for ${zoneType} (zoneId: ${result.zoneId}) in beach ${result.beachName}`);
+          setCurrentAlertMessage(
+            zoneType === 'safe'
+              ? (language === 'fr' ? 'Conditions de baignade sécurisées' : 'Safe swimming conditions')
+              : zoneType === 'danger'
+              ? (language === 'fr' ? 'Conditions de baignade dangereuses. Évitez de nager.' : 'Dangerous swimming conditions. Avoid swimming.')
+              : (language === 'fr' ? 'Aucune alerte disponible' : 'No alert available')
+          );
+          if (settings.locationAlerts) {
+            Alert.alert(
+              language === 'fr' ? 'Alerte Plage' : 'Beach Alert',
+              currentAlertMessage || (language === 'fr' ? 'Aucune alerte disponible' : 'No alert available')
+            );
+          }
+        }
+      } else {
+        console.log('User not inside any known zone');
+        setCurrentZone('unknown');
+        setCurrentZoneId(null);
+        setCurrentBeach(null);
+        setCurrentAlertMessage(language === 'fr' ? 'Aucune zone de plage à proximité' : 'No beach zones nearby');
+      }
+    } catch (error: any) {
+      console.error('Zone check error details:', error.message);
+      setError(language === 'fr' ? `Échec de la vérification de la zone: ${error.message}. Vérifiez la connexion réseau.` : `Failed to check zone: ${error.message}. Check network connection.`);
       setCurrentZone('unknown');
       setCurrentZoneId(null);
       setCurrentBeach(null);
       setCurrentAlertMessage(language === 'fr' ? 'Aucune zone de plage à proximité' : 'No beach zones nearby');
     }
-  } catch (error) {
-    console.error('Zone check error:', error);
-    setError(language === 'fr' ? 'Échec de la vérification de la zone. Vérifiez la connexion réseau.' : 'Failed to check zone. Check network connection.');
-    setCurrentZone('unknown');
-    setCurrentZoneId(null);
-    setCurrentBeach(null);
-    setCurrentAlertMessage(language === 'fr' ? 'Aucune zone de plage à proximité' : 'No beach zones nearby');
-  }
-};
+  };
+
   const toggleLegend = () => {
     setShowLegend(!showLegend);
   };
@@ -633,187 +645,213 @@ const determineCurrentZone = async (coords: LocationCoords): Promise<void> => {
   }, [showQuickActions]);
 
   return (
-    <SafeAreaView className={`flex-1 ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}>
-      <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} backgroundColor={isDarkMode ? '#111827' : '#ffffff'} />
-      <View className={`flex-row items-center justify-between px-4 py-2 ${isDarkMode ? 'bg-gray-800/80' : 'bg-gray-50'} shadow-sm`}>
-        <View className="flex-row items-center">
-          <Ionicons name={getZoneIcon()} size={20} color={getZoneColor(currentZone)} className="mr-2" />
-          <Text className={`text-sm font-medium ${isDarkMode ? 'text-white' : 'text-gray-900'}`} numberOfLines={1}>
-            {loading ? (language === 'fr' ? 'Chargement...' : 'Loading...') : error || currentAlertMessage || (language === 'fr' ? 'Aucune alerte disponible' : 'No alert available')}
-          </Text>
-        </View>
-        <View className="flex-row items-center gap-2">
-          <TouchableOpacity onPress={navigateToNotifications} className={`p-2 rounded-full ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
-            <Ionicons name="notifications-outline" size={18} color={isDarkMode ? '#d1d5db' : '#6b7280'} />
-          </TouchableOpacity>
-          <TouchableOpacity onPress={navigateToSafety} className="flex-row items-center bg-red-500 px-3 py-1 rounded-full">
-            <Ionicons name="shield-checkmark" size={14} color="#ffffff" />
-            <Text className="text-white text-xs font-medium ml-1">{language === 'fr' ? 'Sécurité' : 'Safety'}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={() => setIsDarkMode(!isDarkMode)} className={`p-2 rounded-full ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
-            <Ionicons name={isDarkMode ? 'sunny' : 'moon'} size={18} color={isDarkMode ? '#fbbf24' : '#6b7280'} />
-          </TouchableOpacity>
-          <TouchableOpacity onPress={toggleLanguage} className={`px-3 py-1 rounded-full ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
-            <Text className={`text-xs font-medium ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
-              {language === 'fr' ? 'EN' : 'FR'}
+    <ErrorBoundary>
+      <SafeAreaView className={`flex-1 ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}>
+        <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} backgroundColor={isDarkMode ? '#111827' : '#ffffff'} />
+        <View className={`flex-row items-center justify-between px-4 py-2 ${isDarkMode ? 'bg-gray-800/80' : 'bg-gray-50'} shadow-sm`}>
+          <View className="flex-row items-center">
+            <Ionicons name={getZoneIcon()} size={20} color={getZoneColor(currentZone)} className="mr-2" />
+            <Text className={`text-sm font-medium ${isDarkMode ? 'text-white' : 'text-gray-900'}`} numberOfLines={1}>
+              {loading ? (language === 'fr' ? 'Chargement...' : 'Loading...') : error || currentAlertMessage || (language === 'fr' ? 'Aucune alerte disponible' : 'No alert available')}
             </Text>
+          </View>
+          <View className="flex-row items-center gap-2">
+            <TouchableOpacity onPress={navigateToNotifications} className={`p-2 rounded-full ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
+              <Ionicons name="notifications-outline" size={18} color={isDarkMode ? '#d1d5db' : '#6b7280'} />
+            </TouchableOpacity>
+            <TouchableOpacity onPress={navigateToSafety} className="flex-row items-center bg-red-500 px-3 py-1 rounded-full">
+              <Ionicons name="shield-checkmark" size={14} color="#ffffff" />
+              <Text className="text-white text-xs font-medium ml-1">{language === 'fr' ? 'Sécurité' : 'Safety'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => setIsDarkMode(!isDarkMode)} className={`p-2 rounded-full ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
+              <Ionicons name={isDarkMode ? 'sunny' : 'moon'} size={18} color={isDarkMode ? '#fbbf24' : '#6b7280'} />
+            </TouchableOpacity>
+            <TouchableOpacity onPress={toggleLanguage} className={`px-3 py-1 rounded-full ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
+              <Text className={`text-xs font-medium ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
+                {language === 'fr' ? 'EN' : 'FR'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+        {mapError ? (
+          <View style={styles.map}>
+            <Ionicons name="warning" size={48} color="#ef4444" style={{ alignSelf: 'center', marginTop: 100 }} />
+            <Text style={{ textAlign: 'center', fontSize: 16, color: isDarkMode ? '#ffffff' : '#1f2937', marginVertical: 10 }}>
+              {language === 'fr' ? 'Échec du chargement de la carte : ' : 'Failed to load map: '} {mapError}
+            </Text>
+            <TouchableOpacity
+              style={{ backgroundColor: '#3b82f6', padding: 10, borderRadius: 8, alignSelf: 'center' }}
+              onPress={() => {
+                setMapError(null);
+                fetchBeaches();
+                getUserLocation();
+              }}
+            >
+              <Text style={{ color: '#ffffff', fontWeight: '600' }}>{language === 'fr' ? 'Réessayer' : 'Retry'}</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <MapView
+            ref={mapRef}
+            style={styles.map}
+            provider={PROVIDER_GOOGLE}
+            initialRegion={initialRegion}
+            userInterfaceStyle={isDarkMode ? 'dark' : 'light'}
+            showsUserLocation={true}
+            showsMyLocationButton={false}
+            followsUserLocation={false}
+            customMapStyle={isDarkMode ? darkMapStyle : []}
+            onMapReady={() => console.log('Map initialized successfully')}
+            onError={(error) => {
+              console.error('MapView error:', error);
+              setMapError(error.message || (language === 'fr' ? 'Erreur inconnue de la carte.' : 'Unknown map error.'));
+            }}
+          >
+            {beaches.map((beach) =>
+              beach.zones.map((zone) => {
+                console.log(`Rendering polygon for ${beach.name} - ${zone.name || zone.type} (ID: ${zone.id}, Type: ${zone.type}):`, zone.coordinates);
+                return zone.coordinates.length >= 3 ? (
+                  <Polygon
+                    key={`${beach.id}-${zone.id}`}
+                    coordinates={zone.coordinates}
+                    fillColor={`rgba(${zone.type === 'safe' ? '59, 130, 246' : zone.type === 'sport' ? '239, 68, 68' : '255, 0, 0'}, 0.5)`}
+                    strokeColor={getZoneColor(zone.type)}
+                    strokeWidth={3}
+                  />
+                ) : (
+                  console.warn(`Skipping polygon for ${beach.name} - ${zone.name || zone.type}: invalid coordinates`) || null
+                );
+              })
+            )}
+            {userLocation && (
+              <Marker coordinate={userLocation} anchor={{ x: 0.5, y: 0.5 }}>
+                <View className="w-5 h-5 rounded-full bg-blue-500 border-2 border-white shadow-md" />
+              </Marker>
+            )}
+          </MapView>
+        )}
+        <View className="absolute bottom-28 right-4 gap-2">
+          <TouchableOpacity onPress={centerMapOnUser} className="w-12 h-12 rounded-full bg-blue-500 justify-center items-center shadow-lg">
+            <Ionicons name="locate" size={22} color="#ffffff" />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={toggleLegend} className={`w-12 h-12 rounded-full ${isDarkMode ? 'bg-gray-800' : 'bg-white'} border ${isDarkMode ? 'border-gray-700' : 'border-gray-200'} justify-center items-center shadow-lg`}>
+            <Ionicons name="information-circle" size={22} color={isDarkMode ? '#ffffff' : '#374151'} />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={testFetchAlerts} className={`w-12 h-12 rounded-full ${isDarkMode ? 'bg-gray-800' : 'bg-white'} border ${isDarkMode ? 'border-gray-700' : 'border-gray-200'} justify-center items-center shadow-lg`}>
+            <Ionicons name="notifications" size={22} color={isDarkMode ? '#ffffff' : '#374151'} />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={toggleQuickActions} className="w-14 h-14 rounded-full bg-emerald-500 justify-center items-center shadow-lg">
+            <Ionicons name={showQuickActions ? 'close' : 'menu'} size={24} color="#ffffff" />
           </TouchableOpacity>
         </View>
-      </View>
-      <MapView
-        ref={mapRef}
-        style={styles.map}
-        provider={PROVIDER_GOOGLE}
-        initialRegion={initialRegion}
-        userInterfaceStyle={isDarkMode ? 'dark' : 'light'}
-        showsUserLocation={true}
-        showsMyLocationButton={false}
-        followsUserLocation={false}
-        customMapStyle={isDarkMode ? darkMapStyle : []}
-      >
-        {beaches.map((beach) =>
-          beach.zones.map((zone) => {
-            console.log(`Attempting to render polygon for ${beach.name} - ${zone.name || zone.type} (ID: ${zone.id}, Type: ${zone.type}):`, zone.coordinates);
-            return zone.coordinates.length >= 3 ? (
-              <Polygon
-                key={`${beach.id}-${zone.id}`}
-                coordinates={zone.coordinates}
-                fillColor={`rgba(${zone.type === 'safe' ? '59, 130, 246' : zone.type === 'sport' ? '239, 68, 68' : '255, 0, 0'}, 0.5)`}
-                strokeColor={getZoneColor(zone.type)}
-                strokeWidth={3}
-              />
-            ) : (
-              console.warn(`Skipping polygon for ${beach.name} - ${zone.name || zone.type}: invalid coordinates`)
-            );
-          })
+        {showQuickActions && (
+          <Animated.View
+            className="absolute bottom-44 right-4 gap-2"
+            style={{
+              transform: [
+                { scale: quickActionsAnimation.interpolate({ inputRange: [0, 1], outputRange: [0.8, 1] }) },
+                { translateY: quickActionsAnimation.interpolate({ inputRange: [0, 1], outputRange: [20, 0] }) },
+              ],
+              opacity: quickActionsAnimation,
+            }}
+          >
+            <TouchableOpacity onPress={navigateToSafety} className="flex-row items-center bg-red-500 px-4 py-2 rounded-xl shadow-md min-w-32">
+              <Ionicons name="shield-checkmark-outline" size={18} color="#ffffff" />
+              <Text className="text-white font-medium text-sm ml-2">{language === 'fr' ? 'Infos Sécurité' : 'Safety Info'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={navigateToNotifications} className="flex-row items-center bg-purple-500 px-4 py-2 rounded-xl shadow-md min-w-32">
+              <Ionicons name="notifications-outline" size={18} color="#ffffff" />
+              <Text className="text-white font-medium text-sm ml-2">{language === 'fr' ? 'Notifications' : 'Notifications'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => Linking.openURL('tel:112')} className="flex-row items-center bg-amber-500 px-4 py-2 rounded-xl shadow-md min-w-32">
+              <Ionicons name="call-outline" size={18} color="#ffffff" />
+              <Text className="text-white font-medium text-sm ml-2">{language === 'fr' ? 'Urgence' : 'Emergency'}</Text>
+            </TouchableOpacity>
+          </Animated.View>
         )}
-        {userLocation && (
-          <Marker coordinate={userLocation} anchor={{ x: 0.5, y: 0.5 }}>
-            <View className="w-5 h-5 rounded-full bg-blue-500 border-2 border-white shadow-md" />
-          </Marker>
-        )}
-      </MapView>
-      <View className="absolute bottom-28 right-4 gap-2">
-        <TouchableOpacity onPress={centerMapOnUser} className="w-12 h-12 rounded-full bg-blue-500 justify-center items-center shadow-lg">
-          <Ionicons name="locate" size={22} color="#ffffff" />
-        </TouchableOpacity>
-        <TouchableOpacity onPress={toggleLegend} className={`w-12 h-12 rounded-full ${isDarkMode ? 'bg-gray-800' : 'bg-white'} border ${isDarkMode ? 'border-gray-700' : 'border-gray-200'} justify-center items-center shadow-lg`}>
-          <Ionicons name="information-circle" size={22} color={isDarkMode ? '#ffffff' : '#374151'} />
-        </TouchableOpacity>
-        <TouchableOpacity onPress={testFetchAlerts} className={`w-12 h-12 rounded-full ${isDarkMode ? 'bg-gray-800' : 'bg-white'} border ${isDarkMode ? 'border-gray-700' : 'border-gray-200'} justify-center items-center shadow-lg`}>
-          <Ionicons name="notifications" size={22} color={isDarkMode ? '#ffffff' : '#374151'} />
-        </TouchableOpacity>
-        <TouchableOpacity onPress={toggleQuickActions} className="w-14 h-14 rounded-full bg-emerald-500 justify-center items-center shadow-lg">
-          <Ionicons name={showQuickActions ? 'close' : 'menu'} size={24} color="#ffffff" />
-        </TouchableOpacity>
-      </View>
-      {showQuickActions && (
-        <Animated.View
-          className="absolute bottom-44 right-4 gap-2"
-          style={{
-            transform: [
-              { scale: quickActionsAnimation.interpolate({ inputRange: [0, 1], outputRange: [0.8, 1] }) },
-              { translateY: quickActionsAnimation.interpolate({ inputRange: [0, 1], outputRange: [20, 0] }) },
-            ],
-            opacity: quickActionsAnimation,
-          }}
-        >
-          <TouchableOpacity onPress={navigateToSafety} className="flex-row items-center bg-red-500 px-4 py-2 rounded-xl shadow-md min-w-32">
-            <Ionicons name="shield-checkmark-outline" size={18} color="#ffffff" />
-            <Text className="text-white font-medium text-sm ml-2">{language === 'fr' ? 'Infos Sécurité' : 'Safety Info'}</Text>
+        <View className={`absolute bottom-0 left-0 right-0 px-4 py-2 ${isDarkMode ? 'bg-gray-800/80' : 'bg-gray-50'} flex-row justify-between items-center shadow-sm`}>
+          <View>
+            <Text className={`text-xs ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
+              {language === 'fr' ? 'Besoin d\'aide?' : 'Need help?'}
+            </Text>
+            <Text className={`text-xs font-medium ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+              {language === 'fr' ? 'Consultez nos conseils de sécurité' : 'Check our safety guidelines'}
+            </Text>
+          </View>
+          <TouchableOpacity onPress={navigateToSafety} className="flex-row items-center bg-blue-500 px-3 py-1 rounded-xl">
+            <Ionicons name="book-outline" size={14} color="#ffffff" />
+            <Text className="text-white font-medium text-xs ml-1">{language === 'fr' ? 'Guide' : 'Guide'}</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={navigateToNotifications} className="flex-row items-center bg-purple-500 px-4 py-2 rounded-xl shadow-md min-w-32">
-            <Ionicons name="notifications-outline" size={18} color="#ffffff" />
-            <Text className="text-white font-medium text-sm ml-2">{language === 'fr' ? 'Notifications' : 'Notifications'}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={() => Linking.openURL('tel:112')} className="flex-row items-center bg-amber-500 px-4 py-2 rounded-xl shadow-md min-w-32">
-            <Ionicons name="call-outline" size={18} color="#ffffff" />
-            <Text className="text-white font-medium text-sm ml-2">{language === 'fr' ? 'Urgence' : 'Emergency'}</Text>
-          </TouchableOpacity>
-        </Animated.View>
-      )}
-      <View className={`absolute bottom-0 left-0 right-0 px-4 py-2 ${isDarkMode ? 'bg-gray-800/80' : 'bg-gray-50'} flex-row justify-between items-center shadow-sm`}>
-        <View>
-          <Text className={`text-xs ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
-            {language === 'fr' ? 'Besoin d\'aide?' : 'Need help?'}
-          </Text>
-          <Text className={`text-xs font-medium ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
-            {language === 'fr' ? 'Consultez nos conseils de sécurité' : 'Check our safety guidelines'}
-          </Text>
         </View>
-        <TouchableOpacity onPress={navigateToSafety} className="flex-row items-center bg-blue-500 px-3 py-1 rounded-xl">
-          <Ionicons name="book-outline" size={14} color="#ffffff" />
-          <Text className="text-white font-medium text-xs ml-1">{language === 'fr' ? 'Guide' : 'Guide'}</Text>
-        </TouchableOpacity>
-      </View>
-      {error && (
-        <Modal transparent={true} animationType="fade" visible={!!error}>
-          <View className="flex-1 justify-center items-center bg-black/50">
-            <View className={`rounded-xl p-4 w-4/5 ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}>
-              <Ionicons name="warning" size={32} color="#ef4444" className="mb-2 self-center" />
-              <Text className={`text-sm text-center ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>{error}</Text>
-              <View className="flex-row gap-2 mt-4">
-                <TouchableOpacity onPress={() => { fetchBeaches(); if (currentBeach?.id) fetchAlerts(currentBeach.id); getUserLocation(); }} className="flex-1 bg-blue-500 py-2 rounded-lg">
-                  <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Réessayer Tout' : 'Retry All'}</Text>
+        {error && (
+          <Modal transparent={true} animationType="fade" visible={!!error}>
+            <View className="flex-1 justify-center items-center bg-black/50">
+              <View className={`rounded-xl p-4 w-4/5 ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}>
+                <Ionicons name="warning" size={32} color="#ef4444" className="mb-2 self-center" />
+                <Text className={`text-sm text-center ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>{error}</Text>
+                <View className="flex-row gap-2 mt-4">
+                  <TouchableOpacity onPress={() => { fetchBeaches(); if (currentBeach?.id) fetchAlerts(currentBeach.id); getUserLocation(); setError(null); }} className="flex-1 bg-blue-500 py-2 rounded-lg">
+                    <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Réessayer Tout' : 'Retry All'}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => { if (currentBeach?.id) fetchAlerts(currentBeach.id); setError(null); }} className="flex-1 bg-emerald-500 py-2 rounded-lg">
+                    <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Réessayer Alertes' : 'Retry Alerts'}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => setError(null)} className="flex-1 bg-gray-500 py-2 rounded-lg">
+                    <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Fermer' : 'Close'}</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </View>
+          </Modal>
+        )}
+        {showLegend && (
+          <View className="absolute bottom-0 left-0 right-0 bg-black/50 justify-end">
+            <Animated.View
+              className={`rounded-t-2xl px-4 py-5 ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}
+              style={{ transform: [{ translateY: legendAnimation.interpolate({ inputRange: [0, 1], outputRange: [300, 0] }) }] }}
+            >
+              <View className={`w-8 h-1 rounded-full ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'} self-center mb-4`} />
+              <Text className={`text-base font-medium text-center ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+                {language === 'fr' ? 'Légende des zones' : 'Zone Legend'}
+              </Text>
+              <View className="gap-3 mt-4">
+                <View className="flex-row items-center">
+                  <View className="w-4 h-4 rounded bg-blue-500 mr-2" />
+                  <Text className={`text-sm ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+                    {language === 'fr' ? 'Zone de baignade (sécurisée)' : 'Swimming zone (safe)'}
+                  </Text>
+                </View>
+                <View className="flex-row items-center">
+                  <View className="w-4 h-4 rounded bg-red-500 mr-2" />
+                  <Text className={`text-sm ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+                    {language === 'fr' ? 'Zone de sports nautiques (kite, windsurf)' : 'Water sports zone (kite, windsurf)'}
+                  </Text>
+                </View>
+                <View className="flex-row items-center">
+                  <View className="w-4 h-4 rounded bg-red-600 mr-2" />
+                  <Text className={`text-sm ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+                    {language === 'fr' ? 'Zone dangereuse (éviter)' : 'Dangerous zone (avoid)'}
+                  </Text>
+                </View>
+              </View>
+              <View className="flex-row gap-2 mt-5">
+                <TouchableOpacity onPress={navigateToSafety} className="flex-1 bg-red-500 py-2 rounded-lg flex-row justify-center items-center">
+                  <Ionicons name="shield-checkmark" size={14} color="#ffffff" />
+                  <Text className="text-white text-xs font-medium ml-1">{language === 'fr' ? 'Sécurité' : 'Safety'}</Text>
                 </TouchableOpacity>
-                <TouchableOpacity onPress={() => currentBeach?.id && fetchAlerts(currentBeach.id)} className="flex-1 bg-emerald-500 py-2 rounded-lg">
-                  <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Réessayer Alertes' : 'Retry Alerts'}</Text>
+                <TouchableOpacity onPress={navigateToNotifications} className="flex-1 bg-purple-500 py-2 rounded-lg flex-row justify-center items-center">
+                  <Ionicons name="notifications" size={14} color="#ffffff" />
+                  <Text className="text-white text-xs font-medium ml-1">{language === 'fr' ? 'Alertes' : 'Alerts'}</Text>
                 </TouchableOpacity>
-                <TouchableOpacity onPress={() => setError(null)} className="flex-1 bg-gray-500 py-2 rounded-lg">
+                <TouchableOpacity onPress={() => setShowLegend(false)} className="flex-1 bg-blue-500 py-2 rounded-lg">
                   <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Fermer' : 'Close'}</Text>
                 </TouchableOpacity>
               </View>
-            </View>
+            </Animated.View>
           </View>
-        </Modal>
-      )}
-      {showLegend && (
-        <View className="absolute bottom-0 left-0 right-0 bg-black/50 justify-end">
-          <Animated.View
-            className={`rounded-t-2xl px-4 py-5 ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}
-            style={{ transform: [{ translateY: legendAnimation.interpolate({ inputRange: [0, 1], outputRange: [300, 0] }) }] }}
-          >
-            <View className={`w-8 h-1 rounded-full ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'} self-center mb-4`} />
-            <Text className={`text-base font-medium text-center ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
-              {language === 'fr' ? 'Légende des zones' : 'Zone Legend'}
-            </Text>
-            <View className="gap-3 mt-4">
-              <View className="flex-row items-center">
-                <View className="w-4 h-4 rounded bg-blue-500 mr-2" />
-                <Text className={`text-sm ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
-                  {language === 'fr' ? 'Zone de baignade (sécurisée)' : 'Swimming zone (safe)'}
-                </Text>
-              </View>
-              <View className="flex-row items-center">
-                <View className="w-4 h-4 rounded bg-red-500 mr-2" />
-                <Text className={`text-sm ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
-                  {language === 'fr' ? 'Zone de sports nautiques (kite, windsurf)' : 'Water sports zone (kite, windsurf)'}
-                </Text>
-              </View>
-              <View className="flex-row items-center">
-                <View className="w-4 h-4 rounded bg-red-600 mr-2" />
-                <Text className={`text-sm ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
-                  {language === 'fr' ? 'Zone dangereuse (éviter)' : 'Dangerous zone (avoid)'}
-                </Text>
-              </View>
-            </View>
-            <View className="flex-row gap-2 mt-5">
-              <TouchableOpacity onPress={navigateToSafety} className="flex-1 bg-red-500 py-2 rounded-lg flex-row justify-center items-center">
-                <Ionicons name="shield-checkmark" size={14} color="#ffffff" />
-                <Text className="text-white text-xs font-medium ml-1">{language === 'fr' ? 'Sécurité' : 'Safety'}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity onPress={navigateToNotifications} className="flex-1 bg-purple-500 py-2 rounded-lg flex-row justify-center items-center">
-                <Ionicons name="notifications" size={14} color="#ffffff" />
-                <Text className="text-white text-xs font-medium ml-1">{language === 'fr' ? 'Alertes' : 'Alerts'}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity onPress={() => setShowLegend(false)} className="flex-1 bg-blue-500 py-2 rounded-lg">
-                <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Fermer' : 'Close'}</Text>
-              </TouchableOpacity>
-            </View>
-          </Animated.View>
-        </View>
-      )}
-    </SafeAreaView>
+        )}
+      </SafeAreaView>
+    </ErrorBoundary>
   );
 }
 
