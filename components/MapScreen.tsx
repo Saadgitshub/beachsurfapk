@@ -12,8 +12,10 @@ import {
   StyleSheet,
   Modal,
   Alert,
+  FlatList,
 } from 'react-native';
 import MapView, { Marker, Polygon, PROVIDER_GOOGLE } from 'react-native-maps';
+import MapViewDirections from 'react-native-maps-directions';
 import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
@@ -24,7 +26,7 @@ import { useSettings } from '../SettingsContext';
 
 type ZoneType = 'safe' | 'sport' | 'danger' | 'unknown';
 type LanguageType = 'fr' | 'en';
-type IoniconName = 'checkmark-circle' | 'fitness' | 'warning' | 'notifications-outline' | 'shield-checkmark' | 'moon' | 'sunny' | 'locate' | 'menu' | 'close' | 'shield-checkmark-outline' | 'call-outline' | 'book-outline' | 'notifications' | 'information-circle';
+type IoniconName = 'checkmark-circle' | 'fitness' | 'warning' | 'notifications-outline' | 'shield-checkmark' | 'moon' | 'sunny' | 'locate' | 'menu' | 'close' | 'shield-checkmark-outline' | 'call-outline' | 'book-outline' | 'notifications' | 'information-circle' | 'map-outline';
 
 type RootStackParamList = {
   Onboarding: undefined;
@@ -78,6 +80,7 @@ interface User {
 
 const { width } = Dimensions.get('window');
 const BASE_URL = 'http://192.168.1.2:8080';
+const GOOGLE_MAPS_API_KEY = 'AIzaSyCt3UNCLRLs9Q9rEhZygVBwrKIpyiZFp48';
 const USE_MOCK_LOCATION = false;
 
 interface ErrorBoundaryProps {
@@ -123,6 +126,11 @@ export default function MapScreen() {
   const [currentAlertMessage, setCurrentAlertMessage] = useState<string | null>(null);
   const [showLegend, setShowLegend] = useState<boolean>(false);
   const [showQuickActions, setShowQuickActions] = useState<boolean>(false);
+  const [showBeachSelector, setShowBeachSelector] = useState<boolean>(false);
+  const [showZoneSelector, setShowZoneSelector] = useState<boolean>(false);
+  const [selectedBeach, setSelectedBeach] = useState<Beach | null>(null);
+  const [showDirections, setShowDirections] = useState<boolean>(false);
+  const [destination, setDestination] = useState<LocationCoords | null>(null);
   const [beaches, setBeaches] = useState<Beach[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -157,8 +165,56 @@ export default function MapScreen() {
     }
     checkFCMToken();
     fetchBeaches();
-    getUserLocation();
-  }, [settings.locationAlerts]);
+  }, [language, settings.locationAlerts]);
+
+  // Real-time user tracking
+  useEffect(() => {
+    let subscription;
+    const startWatching = async () => {
+      if (USE_MOCK_LOCATION) {
+        console.log('Using mock location for Safi Bathing Zone');
+        const mockLocation = { latitude: 32.299507, longitude: -9.237183 };
+        setUserLocation(mockLocation);
+        await updateUserLocation(mockLocation);
+        await determineCurrentZone(mockLocation);
+        return;
+      }
+
+      let { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        console.warn('Permission to access location denied');
+        setError(language === 'fr' ? 'Permission d\'accès à la localisation refusée.' : 'Permission to access location denied.');
+        await fetchUserLocation();
+        return;
+      }
+
+      subscription = await Location.watchPositionAsync(
+        {
+          accuracy: Location.Accuracy.High,
+          timeInterval: 5000, // Update every 5 seconds (Android)
+          distanceInterval: 10, // Update if moved 10 meters
+        },
+        (location) => {
+          const newLocation = {
+            latitude: location.coords.latitude,
+            longitude: location.coords.longitude,
+          };
+          console.log('Updated user location:', newLocation);
+          setUserLocation(newLocation);
+          updateUserLocation(newLocation);
+          determineCurrentZone(newLocation);
+        }
+      );
+    };
+
+    startWatching();
+
+    return () => {
+      if (subscription) {
+        subscription.remove();
+      }
+    };
+  }, [language, settings.locationAlerts]);
 
   const mapZoneType = (backendType: string): ZoneType => {
     const type = backendType.toUpperCase();
@@ -324,44 +380,6 @@ export default function MapScreen() {
     }
   };
 
-  const getUserLocation = async () => {
-    try {
-      console.log('Requesting device location...');
-      if (USE_MOCK_LOCATION) {
-        console.log('Using mock location for Safi Bathing Zone');
-        const mockLocation = { latitude: 32.299507, longitude: -9.237183 };
-        setUserLocation(mockLocation);
-        await updateUserLocation(mockLocation);
-        await determineCurrentZone(mockLocation);
-        return;
-      }
-      let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        console.warn('Permission to access location denied');
-        setError(language === 'fr' ? 'Permission d\'accès à la localisation refusée.' : 'Permission to access location denied.');
-        await fetchUserLocation();
-        return;
-      }
-      let location = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.BestForNavigation,
-        timeout: 30000,
-      });
-      console.log('Raw location data:', location);
-      const newLocation = {
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
-      };
-      console.log('Device location:', newLocation);
-      setUserLocation(newLocation);
-      await updateUserLocation(newLocation);
-      await determineCurrentZone(newLocation);
-    } catch (error) {
-      console.error('Device location error:', error);
-      setError(language === 'fr' ? 'Échec de l\'obtention de la localisation.' : 'Failed to get device location.');
-      await fetchUserLocation();
-    }
-  };
-
   const centerMapOnUser = async (): Promise<void> => {
     try {
       console.log('Centering map on user location...');
@@ -521,7 +539,7 @@ export default function MapScreen() {
         const zoneType = mapZoneType(result.zoneType);
         setCurrentZone(zoneType);
         setCurrentZoneId(result.zoneId);
-        setCurrentBeach({ id: result.beachId, name: result.beachName, city: 'Safi', description: '', zones: [] });
+        setCurrentBeach({ id: result.beachId, name: result.beachName, city: result.beachName.includes('Essaouira') ? 'Essaouira' : 'Safi', description: '', zones: [] });
         console.log(`Fetching alerts for beachId: ${result.beachId}`);
         const alerts = await fetchAlerts(result.beachId);
         console.log(`Alerts received:`, alerts);
@@ -540,27 +558,28 @@ export default function MapScreen() {
             );
           }
         } else {
-          console.warn(`No alert found for ${zoneType} (zoneId: ${result.zoneId}) in beach ${result.beachName}`);
-          setCurrentAlertMessage(
-            zoneType === 'safe'
-              ? (language === 'fr' ? 'Conditions de baignade sécurisées' : 'Safe swimming conditions')
-              : zoneType === 'danger'
-              ? (language === 'fr' ? 'Conditions de baignade dangereuses. Évitez de nager.' : 'Dangerous swimming conditions. Avoid swimming.')
-              : (language === 'fr' ? 'Aucune alerte disponible' : 'No alert available')
-          );
-          if (settings.locationAlerts) {
+          console.warn(`No specific alert found for ${zoneType} (zoneId: ${result.zoneId}) in beach ${result.beachName}`);
+          const zoneMessage = zoneType === 'safe'
+            ? (language === 'fr' ? 'Conditions de baignade sécurisées' : 'Safe swimming conditions')
+            : zoneType === 'sport'
+            ? (language === 'fr' ? 'Zone de surf. Prudence recommandée.' : 'Surfing zone. Exercise caution.')
+            : (language === 'fr' ? 'Conditions de baignade dangereuses. Évitez de nager.' : 'Dangerous swimming conditions. Avoid swimming.');
+          setCurrentAlertMessage(zoneMessage);
+          if (settings.locationAlerts && previousZoneRef.current !== zoneType) {
             Alert.alert(
               language === 'fr' ? 'Alerte Plage' : 'Beach Alert',
-              currentAlertMessage || (language === 'fr' ? 'Aucune alerte disponible' : 'No alert available')
+              zoneMessage
             );
           }
         }
+        previousZoneRef.current = zoneType;
       } else {
         console.log('User not inside any known zone');
         setCurrentZone('unknown');
         setCurrentZoneId(null);
         setCurrentBeach(null);
         setCurrentAlertMessage(language === 'fr' ? 'Aucune zone de plage à proximité' : 'No beach zones nearby');
+        previousZoneRef.current = 'unknown';
       }
     } catch (error: any) {
       console.error('Zone check error details:', error.message);
@@ -569,6 +588,7 @@ export default function MapScreen() {
       setCurrentZoneId(null);
       setCurrentBeach(null);
       setCurrentAlertMessage(language === 'fr' ? 'Aucune zone de plage à proximité' : 'No beach zones nearby');
+      previousZoneRef.current = 'unknown';
     }
   };
 
@@ -598,6 +618,50 @@ export default function MapScreen() {
   const testFetchAlerts = () => {
     console.log('Manually triggering fetchAlerts for Safi Beach (ID: 2)');
     fetchAlerts(2);
+  };
+
+  const selectBeach = (beach: Beach) => {
+    setSelectedBeach(beach);
+    if (beach.zones.length > 1) {
+      setShowZoneSelector(true);
+    } else if (beach.zones.length === 1) {
+      getItineraryToZone(beach.zones[0]);
+    } else {
+      Alert.alert(
+        language === 'fr' ? 'Erreur' : 'Error',
+        language === 'fr' ? 'Aucune zone disponible pour cette plage.' : 'No zones available for this beach.'
+      );
+    }
+    setShowBeachSelector(false);
+  };
+
+  const getItineraryToZone = (zone: Zone) => {
+    if (!zone.coordinates[0]) {
+      Alert.alert(
+        language === 'fr' ? 'Erreur' : 'Error',
+        language === 'fr' ? 'Aucune coordonnée disponible pour cette zone.' : 'No coordinates available for this zone.'
+      );
+      return;
+    }
+    if (!userLocation) {
+      Alert.alert(
+        language === 'fr' ? 'Erreur' : 'Error',
+        language === 'fr' ? 'Localisation de l\'utilisateur non disponible.' : 'User location not available.'
+      );
+      return;
+    }
+
+    const zoneCoord = zone.coordinates[0];
+    setDestination(zoneCoord);
+    setShowDirections(true);
+    setShowZoneSelector(false);
+
+    if (mapRef.current) {
+      mapRef.current.fitToCoordinates([userLocation, zoneCoord], {
+        edgePadding: { top: 50, right: 50, bottom: 50, left: 50 },
+        animated: true,
+      });
+    }
   };
 
   const getZoneIcon = (): IoniconName => {
@@ -649,10 +713,10 @@ export default function MapScreen() {
       <SafeAreaView className={`flex-1 ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}>
         <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} backgroundColor={isDarkMode ? '#111827' : '#ffffff'} />
         <View className={`flex-row items-center justify-between px-4 py-2 ${isDarkMode ? 'bg-gray-800/80' : 'bg-gray-50'} shadow-sm`}>
-          <View className="flex-row items-center">
+          <View className="flex-row items-center flex-1">
             <Ionicons name={getZoneIcon()} size={20} color={getZoneColor(currentZone)} className="mr-2" />
             <Text className={`text-sm font-medium ${isDarkMode ? 'text-white' : 'text-gray-900'}`} numberOfLines={1}>
-              {loading ? (language === 'fr' ? 'Chargement...' : 'Loading...') : error || currentAlertMessage || (language === 'fr' ? 'Aucune alerte disponible' : 'No alert available')}
+              {loading ? (language === 'fr' ? 'Chargement...' : 'Loading...') : currentAlertMessage || (language === 'fr' ? 'Aucune zone de plage à proximité' : 'No beach zones nearby')}
             </Text>
           </View>
           <View className="flex-row items-center gap-2">
@@ -684,7 +748,6 @@ export default function MapScreen() {
               onPress={() => {
                 setMapError(null);
                 fetchBeaches();
-                getUserLocation();
               }}
             >
               <Text style={{ color: '#ffffff', fontWeight: '600' }}>{language === 'fr' ? 'Réessayer' : 'Retry'}</Text>
@@ -728,6 +791,25 @@ export default function MapScreen() {
                 <View className="w-5 h-5 rounded-full bg-blue-500 border-2 border-white shadow-md" />
               </Marker>
             )}
+            {showDirections && userLocation && destination && (
+              <MapViewDirections
+                origin={userLocation}
+                destination={destination}
+                apikey={GOOGLE_MAPS_API_KEY}
+                strokeWidth={4}
+                strokeColor="blue"
+                mode="DRIVING"
+                onReady={(result) => {
+                  console.log(`Route: ${result.distance} km, ${result.duration} min`);
+                }}
+                onError={(errorMessage) => {
+                  console.error('Directions error:', errorMessage);
+                  setError(language === 'fr' ? `Échec de l'itinéraire: ${errorMessage}` : `Directions failed: ${errorMessage}`);
+                  setShowDirections(false);
+                  setDestination(null);
+                }}
+              />
+            )}
           </MapView>
         )}
         <View className="absolute bottom-28 right-4 gap-2">
@@ -739,6 +821,9 @@ export default function MapScreen() {
           </TouchableOpacity>
           <TouchableOpacity onPress={testFetchAlerts} className={`w-12 h-12 rounded-full ${isDarkMode ? 'bg-gray-800' : 'bg-white'} border ${isDarkMode ? 'border-gray-700' : 'border-gray-200'} justify-center items-center shadow-lg`}>
             <Ionicons name="notifications" size={22} color={isDarkMode ? '#ffffff' : '#374151'} />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => setShowBeachSelector(true)} className={`w-12 h-12 rounded-full ${isDarkMode ? 'bg-gray-800' : 'bg-white'} border ${isDarkMode ? 'border-gray-700' : 'border-gray-200'} justify-center items-center shadow-lg`}>
+            <Ionicons name="map-outline" size={22} color={isDarkMode ? '#ffffff' : '#374151'} />
           </TouchableOpacity>
           <TouchableOpacity onPress={toggleQuickActions} className="w-14 h-14 rounded-full bg-emerald-500 justify-center items-center shadow-lg">
             <Ionicons name={showQuickActions ? 'close' : 'menu'} size={24} color="#ffffff" />
@@ -790,7 +875,7 @@ export default function MapScreen() {
                 <Ionicons name="warning" size={32} color="#ef4444" className="mb-2 self-center" />
                 <Text className={`text-sm text-center ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>{error}</Text>
                 <View className="flex-row gap-2 mt-4">
-                  <TouchableOpacity onPress={() => { fetchBeaches(); if (currentBeach?.id) fetchAlerts(currentBeach.id); getUserLocation(); setError(null); }} className="flex-1 bg-blue-500 py-2 rounded-lg">
+                  <TouchableOpacity onPress={() => { fetchBeaches(); if (currentBeach?.id) fetchAlerts(currentBeach.id); setError(null); }} className="flex-1 bg-blue-500 py-2 rounded-lg">
                     <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Réessayer Tout' : 'Retry All'}</Text>
                   </TouchableOpacity>
                   <TouchableOpacity onPress={() => { if (currentBeach?.id) fetchAlerts(currentBeach.id); setError(null); }} className="flex-1 bg-emerald-500 py-2 rounded-lg">
@@ -800,6 +885,84 @@ export default function MapScreen() {
                     <Text className="text-white text-xs font-medium text-center">{language === 'fr' ? 'Fermer' : 'Close'}</Text>
                   </TouchableOpacity>
                 </View>
+              </View>
+            </View>
+          </Modal>
+        )}
+        {showBeachSelector && (
+          <Modal transparent={true} animationType="slide" visible={showBeachSelector}>
+            <View className="flex-1 justify-end bg-black/50">
+              <View className={`rounded-t-2xl px-4 py-5 ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}>
+                <View className={`w-8 h-1 rounded-full ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'} self-center mb-4`} />
+                <Text className={`text-base font-medium text-center ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+                  {language === 'fr' ? 'Sélectionner une plage' : 'Select a Beach'}
+                </Text>
+                <FlatList
+                  data={beaches}
+                  keyExtractor={(item) => item.id.toString()}
+                  renderItem={({ item }) => (
+                    <TouchableOpacity
+                      className={`p-3 rounded-lg ${isDarkMode ? 'bg-gray-700' : 'bg-gray-100'} mb-2`}
+                      onPress={() => selectBeach(item)}
+                    >
+                      <Text className={`text-sm ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+                        {item.name} ({item.city})
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                  ListEmptyComponent={
+                    <Text className={`text-sm text-center ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
+                      {language === 'fr' ? 'Aucune plage disponible' : 'No beaches available'}
+                    </Text>
+                  }
+                />
+                <TouchableOpacity
+                  onPress={() => setShowBeachSelector(false)}
+                  className="bg-blue-500 py-2 rounded-lg mt-4"
+                >
+                  <Text className="text-white text-sm font-medium text-center">
+                    {language === 'fr' ? 'Fermer' : 'Close'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </Modal>
+        )}
+        {showZoneSelector && selectedBeach && (
+          <Modal transparent={true} animationType="slide" visible={showZoneSelector}>
+            <View className="flex-1 justify-end bg-black/50">
+              <View className={`rounded-t-2xl px-4 py-5 ${isDarkMode ? 'bg-gray-800' : 'bg-white'}`}>
+                <View className={`w-8 h-1 rounded-full ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'} self-center mb-4`} />
+                <Text className={`text-base font-medium text-center ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+                  {language === 'fr' ? 'Sélectionner une zone pour ' : 'Select a Zone for '} {selectedBeach.name}
+                </Text>
+                <FlatList
+                  data={selectedBeach.zones}
+                  keyExtractor={(item) => item.id.toString()}
+                  renderItem={({ item }) => (
+                    <TouchableOpacity
+                      className={`p-3 rounded-lg ${isDarkMode ? 'bg-gray-700' : 'bg-gray-100'} mb-2`}
+                      onPress={() => getItineraryToZone(item)}
+                    >
+                      <Text className={`text-sm ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+                        {item.name || item.type} ({item.type === 'safe' ? (language === 'fr' ? 'Baignade' : 'Swimming') : item.type === 'sport' ? (language === 'fr' ? 'Surf' : 'Surfing') : (language === 'fr' ? 'Danger' : 'Danger')})
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                  ListEmptyComponent={
+                    <Text className={`text-sm text-center ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
+                      {language === 'fr' ? 'Aucune zone disponible' : 'No zones available'}
+                    </Text>
+                  }
+                />
+                <TouchableOpacity
+                  onPress={() => setShowZoneSelector(false)}
+                  className="bg-blue-500 py-2 rounded-lg mt-4"
+                >
+                  <Text className="text-white text-sm font-medium text-center">
+                    {language === 'fr' ? 'Fermer' : 'Close'}
+                  </Text>
+                </TouchableOpacity>
               </View>
             </View>
           </Modal>
