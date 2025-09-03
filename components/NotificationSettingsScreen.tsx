@@ -27,7 +27,7 @@ type RootStackParamList = {
 };
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
-const BASE_URL = 'http://192.168.1.2:8080';
+const BASE_URL = 'http://192.168.1.11:8080';
 
 export default function NotificationSettingsScreen() {
   const { settings, updateSettings } = useSettings();

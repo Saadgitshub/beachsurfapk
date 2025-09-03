@@ -20,6 +20,7 @@ import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 import Constants from 'expo-constants';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useSettings } from '../SettingsContext';
@@ -63,7 +64,7 @@ interface Beach {
   zones: Zone[];
 }
 
-interface Alert {
+interface BeachAlert {
   id: number;
   type: string;
   message: string;
@@ -79,7 +80,7 @@ interface User {
 }
 
 const { width } = Dimensions.get('window');
-const BASE_URL = 'http://192.168.1.2:8080';
+const BASE_URL = 'http://192.168.1.11:8080';
 const GOOGLE_MAPS_API_KEY = 'AIzaSyCt3UNCLRLs9Q9rEhZygVBwrKIpyiZFp48';
 const USE_MOCK_LOCATION = false;
 
@@ -132,7 +133,7 @@ export default function MapScreen() {
   const [showDirections, setShowDirections] = useState<boolean>(false);
   const [destination, setDestination] = useState<LocationCoords | null>(null);
   const [beaches, setBeaches] = useState<Beach[]>([]);
-  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [alerts, setAlerts] = useState<BeachAlert[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [mapError, setMapError] = useState<string | null>(null);
@@ -149,6 +150,27 @@ export default function MapScreen() {
     latitudeDelta: 0.01,
     longitudeDelta: 0.01,
   };
+
+  // Load stored alert from AsyncStorage
+  useEffect(() => {
+    const loadStoredAlert = async () => {
+      try {
+        const storedAlert = await AsyncStorage.getItem('latestAlert');
+        if (storedAlert) {
+          const { message, zoneType, zoneId, beachId } = JSON.parse(storedAlert);
+          setCurrentAlertMessage(message);
+          setCurrentZone(mapZoneType(zoneType));
+          setCurrentZoneId(zoneId);
+          if (beachId) {
+            setCurrentBeach({ id: beachId, name: 'Safi Beach', city: 'Safi', description: '', zones: [] });
+          }
+        }
+      } catch (err) {
+        console.error('Error loading stored alert:', err);
+      }
+    };
+    loadStoredAlert();
+  }, []);
 
   useEffect(() => {
     console.log('Settings:', settings);
@@ -299,7 +321,7 @@ export default function MapScreen() {
     }
   };
 
-  const fetchAlerts = async (beachId: number, retryCount = 0): Promise<Alert[]> => {
+  const fetchAlerts = async (beachId: number, retryCount = 0): Promise<BeachAlert[]> => {
     const maxRetries = 3;
     try {
       console.log(`Fetching alerts for beachId ${beachId} (Attempt ${retryCount + 1}/${maxRetries})`);
@@ -309,10 +331,11 @@ export default function MapScreen() {
       if (response.status === 204) {
         console.log(`No alerts for beachId ${beachId}`);
         setAlerts([]);
+        setCurrentAlertMessage(language === 'fr' ? 'Aucune alerte active pour cette plage.' : 'No active alerts for this beach.');
         return [];
       }
       if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
-      const data: Alert[] = await response.json();
+      const data: BeachAlert[] = await response.json();
       console.log('Fetched alerts:', JSON.stringify(data, null, 2));
       setAlerts(data);
       return data;
@@ -323,6 +346,7 @@ export default function MapScreen() {
         return fetchAlerts(beachId, retryCount + 1);
       }
       setError(language === 'fr' ? 'Échec de récupération des alertes.' : 'Failed to fetch alerts.');
+      setCurrentAlertMessage(language === 'fr' ? 'Erreur lors de la récupération des alertes.' : 'Error fetching alerts.');
       return [];
     }
   };
